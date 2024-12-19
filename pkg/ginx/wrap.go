@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-func WrapFinder(fn func(ctx *gin.Context) (Result, error)) gin.HandlerFunc {
+func Wrap(fn func(ctx *gin.Context) (Result, error)) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		res, err := fn(ctx)
 		if err != nil {
@@ -18,7 +18,7 @@ func WrapFinder(fn func(ctx *gin.Context) (Result, error)) gin.HandlerFunc {
 	}
 }
 
-func WrapFinderBody[Req any](fn func(ctx *gin.Context, req Req) (Result, error)) gin.HandlerFunc {
+func WrapBody[Req any](fn func(ctx *gin.Context, req Req) (Result, error)) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		var req Req
 		if err := ctx.Bind(&req); err != nil {

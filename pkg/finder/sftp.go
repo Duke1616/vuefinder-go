@@ -1,4 +1,4 @@
-package finderx
+package finder
 
 import (
 	"archive/zip"
@@ -28,7 +28,21 @@ func NewSftpFinder(client *sftp.Client, user string) Finder {
 	}
 }
 
+func (sf *sftpFinder) Save(ctx context.Context, path, context string) error {
+	//TODO implement me
+	panic("implement me")
+}
+
 func (sf *sftpFinder) Subfolders(ctx context.Context, adapter, path string) ([]FileInfo, error) {
+	if strings.Contains(path, "://") {
+		split := strings.Split(path, "://")
+		if split[1] == "" {
+			path = fmt.Sprintf("/%s", adapter)
+		} else {
+			path = split[1]
+		}
+	}
+
 	files, err := sf.scan(path, adapter)
 	if err != nil {
 		return nil, err
@@ -59,10 +73,10 @@ func (sf *sftpFinder) Preview(ctx context.Context, path string) (bytes.Buffer, e
 	return buff, nil
 }
 
-func (sf *sftpFinder) Search(ctx context.Context, adapter, path, filter string) (*FinderStorages, error) {
+func (sf *sftpFinder) Search(ctx context.Context, adapter, path, filter string) (Storages, error) {
 	storage, err := sf.Index(ctx, adapter, path)
 	if err != nil {
-		return nil, err
+		return Storages{}, err
 	}
 
 	storage.Files = slice.FilterMap(storage.Files, func(idx int, src FileInfo) (FileInfo, bool) {
@@ -84,23 +98,27 @@ func ensureZipExtension(target string) string {
 	return target
 }
 
-func (sf *sftpFinder) Archive(ctx context.Context, files []string, target, base string) error {
+func (sf *sftpFinder) Archive(ctx context.Context, items []Item, target, base string) error {
 	// 判断是否有后缀，如果没有自行添加上
 	zipFileName := ensureZipExtension(ensureZipExtension(target))
 
 	zipFile, err := sf.client.Create(zipFileName)
 	if err != nil {
-		return fmt.Errorf("failed to create zip file: %w", err)
+		return err
 	}
 	defer zipFile.Close()
 
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 
-	for _, file := range files {
-		err = sf.walkAndZip(file, zipWriter, base)
+	for _, item := range items {
+		if blockOperation("archive", base, item.Path) {
+			continue
+		}
+
+		err = sf.walkAndZip(item.Path, zipWriter, base)
 		if err != nil {
-			return fmt.Errorf("failed to walk and zip %s: %w", file, err)
+			return err
 		}
 	}
 
@@ -166,14 +184,37 @@ func (sf *sftpFinder) walkAndZip(path string, zipWriter *zip.Writer, basePath st
 	return nil
 }
 
-func (sf *sftpFinder) Move(ctx context.Context, files []string, target string) error {
-	for _, file := range files {
-		fileName := filepath.Base(file)
+func (sf *sftpFinder) Move(ctx context.Context, items []Item, target string) error {
+	for _, item := range items {
+		fileName := filepath.Base(item.Path)
 		destPath := filepath.Join(target, fileName)
 
-		err := sf.client.Rename(file, destPath)
+		err := sf.client.Rename(item.Path, destPath)
 		if err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (sf *sftpFinder) Remove(ctx context.Context, items []Item, path string) error {
+	for _, item := range items {
+		if blockOperation("remove", path, item.Path) {
+			continue
+		}
+
+		switch item.Type {
+		case DIR:
+			err := sf.RemoveDir(ctx, item.Path)
+			if err != nil {
+				return err
+			}
+		case FILE:
+			err := sf.RemoveFile(ctx, item.Path)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -188,16 +229,30 @@ func (sf *sftpFinder) RemoveFile(ctx context.Context, file string) error {
 	return sf.client.Remove(file)
 }
 
-func (sf *sftpFinder) Rename(ctx context.Context, oldName, newName string) error {
-	return sf.client.Rename(oldName, newName)
+func (sf *sftpFinder) Rename(ctx context.Context, oldPathName, newName, path string) error {
+	newPath := replaceLastPart(oldPathName, newName)
+	if blockOperation("rename", oldPathName, newPath) {
+		return nil
+	}
+
+	return sf.client.Rename(oldPathName, newPath)
 }
 
-func (sf *sftpFinder) NewFolder(ctx context.Context, file string) error {
-	return sf.client.MkdirAll(file)
+func replaceLastPart(originalPath, newName string) string {
+	// 获取路径的父目录
+	parentDir := filepath.Dir(originalPath)
+
+	// 拼接新的路径
+	newPath := filepath.Join(parentDir, newName)
+	return newPath
 }
 
-func (sf *sftpFinder) NewFile(ctx context.Context, file string) error {
-	_, err := sf.client.Create(file)
+func (sf *sftpFinder) NewFolder(ctx context.Context, file string, name string) error {
+	return sf.client.MkdirAll(fmt.Sprintf("/%s/%s", file, name))
+}
+
+func (sf *sftpFinder) NewFile(ctx context.Context, file string, name string) error {
+	_, err := sf.client.Create(fmt.Sprintf("/%s/%s", file, name))
 	return err
 }
 
@@ -216,6 +271,17 @@ func (sf *sftpFinder) Download(ctx context.Context, filePath string) (bytes.Buff
 }
 
 func (sf *sftpFinder) Upload(ctx context.Context, file multipart.File, remoteDir, remoteFile string) error {
+	// 如果 remoteFile 包含 "/"，则需要解析出目录和文件名
+	if strings.Contains(remoteFile, "/") {
+		parts := strings.Split(remoteFile, "/")
+		// 最后一个部分是文件名
+		remoteFile = parts[len(parts)-1]
+		// 前面的部分是目录
+		remoteDir = fmt.Sprintf("%s/%s", remoteDir, strings.Join(parts[:len(parts)-1], "/"))
+	}
+
+	remoteFile = fmt.Sprintf("%s/%s", remoteDir, remoteFile)
+
 	if _, err := sf.client.Stat(remoteDir); os.IsNotExist(err) {
 		if err = sf.client.MkdirAll(remoteDir); err != nil {
 			return err
@@ -235,7 +301,7 @@ func (sf *sftpFinder) Upload(ctx context.Context, file multipart.File, remoteDir
 	return nil
 }
 
-func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (*FinderStorages, error) {
+func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (Storages, error) {
 	var (
 		storages   []string
 		files      []FileInfo
@@ -246,7 +312,7 @@ func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (*FinderS
 
 	// 获取跟目录数据
 	if storages, err = sf.findStorage(); err != nil {
-		return nil, err
+		return Storages{}, err
 	}
 
 	// 如果是第一次请求，则针对用户加目录
@@ -254,18 +320,18 @@ func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (*FinderS
 		newAdapter = adapter
 		dirName = getPath(newAdapter, path)
 		if files, err = sf.scanFiles(dirName, newAdapter); err != nil {
-			return nil, err
+			return Storages{}, err
 		}
 
 	} else {
 		newAdapter = "home"
 		dirName = fmt.Sprintf("/home/%s", sf.user)
 		if files, err = sf.scanFiles(fmt.Sprintf("/home/%s", sf.user), newAdapter); err != nil {
-			return nil, err
+			return Storages{}, err
 		}
 	}
 
-	return &FinderStorages{
+	return Storages{
 		Adapter:  newAdapter,
 		Storages: storages,
 		Dirname:  dirName,
@@ -405,4 +471,14 @@ func matchPath(path string) bool {
 
 	// 只有一个 / 不匹配
 	return count != 1
+}
+
+func blockOperation(action string, oldFile, newFile string) bool {
+	// 根据路径长度，避免删除或修改 .. 上级目录 这种情况
+	if len(oldFile) > len(newFile) {
+		slog.Error("发现触发危险操作, 被系统阻止", slog.String("当前", oldFile), slog.String("处理", newFile), slog.String("动作", action))
+		return true
+	}
+
+	return false
 }
