@@ -1,14 +1,14 @@
 # vuefinder-go
 
-# Example Launch
+## Example Launch
 
-## backend
+### backend
 
 ```
 go run main.go -host 127.0.0.1:22 -password 123456 -user user
 ```
 
-## frontend
+### frontend
 
 ```
 cd example
@@ -16,7 +16,7 @@ pnpm install
 pnpm run dev
 ```
 
-## Access address
+### Access address
 ```
 http://localhost:5173/
 ```
