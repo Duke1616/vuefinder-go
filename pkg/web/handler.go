@@ -23,9 +23,9 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g := server.Group("/api/finder")
 	g.GET("/index", ginx.Wrap(h.Index))
 	g.GET("/subfolders", ginx.Wrap(h.Subfolders))
-	g.GET("/download", ginx.Wrap(h.Download))
+	g.GET("/download", ginx.WrapData(h.Download))
 	g.GET("/search", ginx.Wrap(h.Search))
-	g.GET("/preview", ginx.Wrap(h.Preview))
+	g.GET("/preview", ginx.WrapBuff(h.Preview))
 	g.POST("/upload", ginx.Wrap(h.Upload))
 	g.POST("/new_folder", ginx.WrapBody(h.NewFolder))
 	g.POST("/new_file", ginx.WrapBody(h.NewFile))
@@ -33,7 +33,7 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.POST("/remove", ginx.WrapBody(h.Remove))
 	g.POST("/move", ginx.WrapBody(h.Move))
 	g.POST("/archive", ginx.WrapBody(h.Archive))
-	g.POST("/save", ginx.WrapBody(h.Save))
+	g.POST("/save", ginx.WrapBuffBody(h.Save))
 }
 
 func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
@@ -43,7 +43,7 @@ func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	return ginx.Result{Message: "OK", Data: "OK"}, nil
+	return ginx.Result{Message: "OK", Data: req.Content}, nil
 }
 
 func (h *Handler) Preview(ctx *gin.Context) (ginx.Result, error) {
@@ -59,10 +59,7 @@ func (h *Handler) Preview(ctx *gin.Context) (ginx.Result, error) {
 	contentType := http.DetectContentType(buff.Bytes())
 	ctx.Header("Content-Type", contentType)
 
-	ctx.String(http.StatusOK, "%s", buff.String())
-	return ginx.Result{
-		Message: "ok",
-	}, nil
+	return ginx.Result{Message: "OK", Data: buff.String()}, nil
 }
 
 func (h *Handler) Search(ctx *gin.Context) (ginx.Result, error) {
@@ -208,11 +205,8 @@ func (h *Handler) Download(ctx *gin.Context) (ginx.Result, error) {
 	ctx.Header("Content-Disposition", "attachment; filename="+path.Base(file))
 	ctx.Header("Content-Type", "application/octet-stream")
 
-	// 将文件内容写入 HTTP 响应
-	ctx.Data(http.StatusOK, "application/octet-stream", buff.Bytes())
-
 	return ginx.Result{
-		Message: "ok",
+		Data: buff.Bytes(),
 	}, nil
 }
 

@@ -28,9 +28,21 @@ func NewSftpFinder(client *sftp.Client, user string) Finder {
 	}
 }
 
-func (sf *sftpFinder) Save(ctx context.Context, path, context string) error {
-	//TODO implement me
-	panic("implement me")
+func (sf *sftpFinder) Save(ctx context.Context, path, content string) error {
+	// 使用 os.O_WRONLY|os.O_TRUNC 来覆盖文件内容
+	file, err := sf.client.OpenFile(path, os.O_WRONLY|os.O_TRUNC|os.O_CREATE)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// 写入内容到文件
+	_, err = file.Write([]byte(content))
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (sf *sftpFinder) Subfolders(ctx context.Context, adapter, path string) ([]FileInfo, error) {

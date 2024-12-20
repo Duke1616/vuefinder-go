@@ -31,7 +31,7 @@ type Finder interface {
 	Preview(ctx context.Context, path string) (bytes.Buffer, error)
 	Search(ctx context.Context, adapter, path, filter string) (Storages, error)
 	Subfolders(ctx context.Context, adapter, path string) ([]FileInfo, error)
-	Save(ctx context.Context, path, context string) error
+	Save(ctx context.Context, path, content string) error
 }
 
 type Storages struct {
