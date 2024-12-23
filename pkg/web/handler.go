@@ -13,10 +13,8 @@ type Handler struct {
 	finder finder.Finder
 }
 
-func NewHandler(finder finder.Finder) *Handler {
-	return &Handler{
-		finder: finder,
-	}
+func NewHandler() *Handler {
+	return &Handler{}
 }
 
 func (h *Handler) RegisterRoutes(server *gin.Engine) {
@@ -34,6 +32,10 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.POST("/move", ginx.WrapBody(h.Move))
 	g.POST("/archive", ginx.WrapBody(h.Archive))
 	g.POST("/save", ginx.WrapBuffBody(h.Save))
+}
+
+func (h *Handler) SetFinder(f finder.Finder) {
+	h.finder = f
 }
 
 func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
