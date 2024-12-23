@@ -29,7 +29,7 @@ func main() {
 	client, err := ConnectSSH(*host, *user, *password)
 
 	sftpClient, err := sftp.NewClient(client)
-	f := finder.NewSftpFinder(sftpClient, *user)
+	f := finder.NewSftpFinder(sftpClient)
 	handler := web.NewHandler()
 	handler.SetFinder(f)
 	mlds := ginx.NewMiddleware()

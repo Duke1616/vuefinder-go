@@ -17,14 +17,12 @@ import (
 )
 
 type sftpFinder struct {
-	user   string
 	client *sftp.Client
 }
 
-func NewSftpFinder(client *sftp.Client, user string) Finder {
+func NewSftpFinder(client *sftp.Client) Finder {
 	return &sftpFinder{
 		client: client,
-		user:   user,
 	}
 }
 
@@ -336,9 +334,13 @@ func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (Storages
 		}
 
 	} else {
-		newAdapter = "home"
-		dirName = fmt.Sprintf("/home/%s", sf.user)
-		if files, err = sf.scanFiles(fmt.Sprintf("/home/%s", sf.user), newAdapter); err != nil {
+		var pwd string
+		if pwd, err = sf.client.Getwd(); err != nil {
+			return Storages{}, err
+		}
+		newAdapter = getFirstPathPart(pwd)
+		dirName = pwd
+		if files, err = sf.scanFiles(pwd, newAdapter); err != nil {
 			return Storages{}, err
 		}
 	}
@@ -349,6 +351,16 @@ func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (Storages
 		Dirname:  dirName,
 		Files:    files,
 	}, nil
+}
+
+func getFirstPathPart(path string) string {
+	path = strings.TrimPrefix(path, "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return "null"
+	}
+
+	return parts[0]
 }
 
 func (sf *sftpFinder) findStorage() ([]string, error) {
