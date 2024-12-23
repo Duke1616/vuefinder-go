@@ -1,24 +1,29 @@
 package web
 
 import (
+	"errors"
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
 	"github.com/ecodeclub/ekit/slice"
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"path"
+	"strconv"
 )
 
 type Handler struct {
-	finder finder.Finder
+	finders map[int64]finder.Finder
 }
 
 func NewHandler() *Handler {
-	return &Handler{}
+	return &Handler{
+		finders: make(map[int64]finder.Finder),
+	}
 }
 
 func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g := server.Group("/api/finder")
+
 	g.GET("/index", ginx.Wrap(h.Index))
 	g.GET("/subfolders", ginx.Wrap(h.Subfolders))
 	g.GET("/download", ginx.WrapData(h.Download))
@@ -34,13 +39,33 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.POST("/save", ginx.WrapBuffBody(h.Save))
 }
 
-func (h *Handler) SetFinder(f finder.Finder) {
-	h.finder = f
+func (h *Handler) SetFinder(id int64, f finder.Finder) {
+	h.finders[id] = f
+}
+
+func (h *Handler) getFinder(ctx *gin.Context) (finder.Finder, error) {
+	queryId := ctx.Query("id")
+	id, err := strconv.ParseInt(queryId, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	fd, ok := h.finders[id]
+	if !ok {
+		return nil, errors.New("finder not found")
+	}
+
+	return fd, nil
 }
 
 func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
-	err := h.finder.Save(ctx, pathQuery, req.Content)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	err = fd.Save(ctx, pathQuery, req.Content)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -51,8 +76,13 @@ func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
 func (h *Handler) Preview(ctx *gin.Context) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
 
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
 	// 获取文件内容
-	buff, err := h.finder.Preview(ctx, pathQuery)
+	buff, err := fd.Preview(ctx, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -69,7 +99,12 @@ func (h *Handler) Search(ctx *gin.Context) (ginx.Result, error) {
 	adapter := ctx.Query("adapter")
 	filter := ctx.Query("filter")
 
-	storages, err := h.finder.Search(ctx, adapter, pathQuery, filter)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storages, err := fd.Search(ctx, adapter, pathQuery, filter)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -83,12 +118,16 @@ func (h *Handler) Archive(ctx *gin.Context, req ArchiveReq) (ginx.Result, error)
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.Archive(ctx, toFinderItems(req.Items), req.Name, pathQuery)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+	err = fd.Archive(ctx, toFinderItems(req.Items), req.Name, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -102,13 +141,18 @@ func (h *Handler) Move(ctx *gin.Context, req MoveReq) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.Move(ctx, toFinderItems(req.Items), req.Item)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	err = fd.Move(ctx, toFinderItems(req.Items), req.Item)
 
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -122,12 +166,17 @@ func (h *Handler) Remove(ctx *gin.Context, req RemoveReq) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.Remove(ctx, toFinderItems(req.Items), pathQuery)
+	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	err = fd.Remove(ctx, toFinderItems(req.Items), pathQuery)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -141,12 +190,17 @@ func (h *Handler) Rename(ctx *gin.Context, req RenameReq) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.Rename(ctx, req.Item, req.Name, pathQuery)
+	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	err = fd.Rename(ctx, req.Item, req.Name, pathQuery)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -160,12 +214,17 @@ func (h *Handler) NewFile(ctx *gin.Context, req NewFileReq) (ginx.Result, error)
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.NewFile(ctx, pathQuery, req.Name)
+	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	err = fd.NewFile(ctx, pathQuery, req.Name)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -179,12 +238,17 @@ func (h *Handler) NewFolder(ctx *gin.Context, req NewFolderReq) (ginx.Result, er
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	err := h.finder.NewFolder(ctx, pathQuery, req.Name)
+	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := h.finder.Index(ctx, adapter, pathQuery)
+	err = fd.NewFolder(ctx, pathQuery, req.Name)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storage, err := fd.Index(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -197,7 +261,12 @@ func (h *Handler) NewFolder(ctx *gin.Context, req NewFolderReq) (ginx.Result, er
 func (h *Handler) Download(ctx *gin.Context) (ginx.Result, error) {
 	file := ctx.Query("path")
 
-	buff, err := h.finder.Download(ctx, file)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	buff, err := fd.Download(ctx, file)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -216,7 +285,12 @@ func (h *Handler) Subfolders(ctx *gin.Context) (ginx.Result, error) {
 	pathQuery := ctx.Query("path")
 	adapter := ctx.Query("adapter")
 
-	files, err := h.finder.Subfolders(ctx, adapter, pathQuery)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	files, err := fd.Subfolders(ctx, adapter, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -243,7 +317,12 @@ func (h *Handler) Upload(ctx *gin.Context) (ginx.Result, error) {
 	remoteFile, _ := ctx.GetPostForm("name")
 	remoteDir := ctx.Query("path")
 
-	err = h.finder.Upload(ctx, src, remoteDir, remoteFile)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	err = fd.Upload(ctx, src, remoteDir, remoteFile)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -255,7 +334,12 @@ func (h *Handler) Index(ctx *gin.Context) (ginx.Result, error) {
 	adapterQuery := ctx.Query("adapter")
 	pathQuery := ctx.Query("path")
 
-	data, err := h.finder.Index(ctx, adapterQuery, pathQuery)
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	data, err := fd.Index(ctx, adapterQuery, pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}

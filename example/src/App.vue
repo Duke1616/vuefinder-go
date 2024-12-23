@@ -17,6 +17,7 @@ import { ref } from "vue";
 
 const request = {
   baseUrl: "http://127.0.0.1:8350/api/finder/index",
+  params: { id: 20 },
   transformRequest: (req) => {
     switch (req.params.q) {
       case "upload":

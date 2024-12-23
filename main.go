@@ -31,7 +31,7 @@ func main() {
 	sftpClient, err := sftp.NewClient(client)
 	f := finder.NewSftpFinder(sftpClient)
 	handler := web.NewHandler()
-	handler.SetFinder(f)
+	handler.SetFinder(20, f)
 	mlds := ginx.NewMiddleware()
 	engine := gin.Default()
 	engine.Use(mlds...)
