@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
 	"github.com/ecodeclub/ekit/slice"
@@ -303,31 +304,31 @@ func (h *Handler) Subfolders(ctx *gin.Context) (ginx.Result, error) {
 }
 
 func (h *Handler) Upload(ctx *gin.Context) (ginx.Result, error) {
-	file, err := ctx.FormFile("file")
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
-	}
-
-	src, err := file.Open()
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
-	}
-
 	// 文件名称
 	remoteFile, _ := ctx.GetPostForm("name")
 	remoteDir := ctx.Query("path")
+
+	// 读取文件
+	srcFile, err := ctx.FormFile("file")
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	fmt.Printf("srcFile: %+v\n", srcFile)
 
 	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Upload(ctx, src, remoteDir, remoteFile)
+	err = fd.Upload(ctx, srcFile, remoteDir, remoteFile)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	return ginx.Result{}, nil
+	return ginx.Result{
+		Message: "File uploaded!",
+	}, nil
 }
 
 func (h *Handler) Index(ctx *gin.Context) (ginx.Result, error) {

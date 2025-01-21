@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"mime/multipart"
-	"time"
 )
 
 type FileType string
@@ -18,7 +17,7 @@ const (
 
 type Finder interface {
 	Index(ctx context.Context, adapter, path string) (Storages, error)
-	Upload(ctx context.Context, file multipart.File, remoteDir, remoteFile string) error
+	Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error
 	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
@@ -42,16 +41,16 @@ type Storages struct {
 }
 
 type FileInfo struct {
-	Type          FileType  `json:"type"`
-	Path          string    `json:"path"`
-	Visibility    string    `json:"visibility"`
-	LastModified  time.Time `json:"last_modified"`
-	MimeType      string    `json:"mime_type"`
-	ExtraMetadata []string  `json:"extra_metadata"`
-	Basename      string    `json:"basename"`
-	Extension     string    `json:"extension"`
-	Storage       string    `json:"storage"`
-	FileSize      int64     `json:"file_size"`
+	Type          FileType `json:"type"`
+	Path          string   `json:"path"`
+	Visibility    string   `json:"visibility"`
+	LastModified  int64    `json:"last_modified"`
+	MimeType      string   `json:"mime_type"`
+	ExtraMetadata []string `json:"extra_metadata"`
+	Basename      string   `json:"basename"`
+	Extension     string   `json:"extension"`
+	Storage       string   `json:"storage"`
+	FileSize      int64    `json:"file_size"`
 }
 
 type Item struct {

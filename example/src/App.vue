@@ -63,7 +63,7 @@ const request = {
   },
 };
 
-const maxFileSize = ref("500MB");
+const maxFileSize = ref("600MB");
 const handleSelectButton = {
   active: true,
   multiple: false,

@@ -280,7 +280,7 @@ func (sf *sftpFinder) Download(ctx context.Context, filePath string) (bytes.Buff
 	return buff, nil
 }
 
-func (sf *sftpFinder) Upload(ctx context.Context, file multipart.File, remoteDir, remoteFile string) error {
+func (sf *sftpFinder) Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error {
 	// 如果 remoteFile 包含 "/"，则需要解析出目录和文件名
 	if strings.Contains(remoteFile, "/") {
 		parts := strings.Split(remoteFile, "/")
@@ -298,17 +298,70 @@ func (sf *sftpFinder) Upload(ctx context.Context, file multipart.File, remoteDir
 		}
 	}
 
-	dstFile, err := sf.client.Create(remoteFile)
+	// 打开源文件
+	srcFile, err := src.Open()
+	defer srcFile.Close()
 	if err != nil {
 		return err
 	}
-	defer dstFile.Close()
 
-	if _, err = io.Copy(dstFile, file); err != nil {
+	// 创建并打开目标文件
+	dstFile, err := sf.client.Create(remoteFile)
+	defer dstFile.Close()
+	if err != nil {
 		return err
 	}
 
+	// 缓冲区读取并写入 4MB
+	buffer := make([]byte, 4*1024*1024)
+	for {
+		n, readErr := srcFile.Read(buffer)
+		if n > 0 {
+			if _, writeErr := dstFile.Write(buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+
 	return nil
+}
+
+func parseFilePath(remoteDir, remoteFile string) (string, string) {
+	if strings.Contains(remoteFile, "/") {
+		parts := strings.Split(remoteFile, "/")
+		remoteFile = parts[len(parts)-1]
+		remoteDir = fmt.Sprintf("%s/%s", remoteDir, strings.Join(parts[:len(parts)-1], "/"))
+	}
+
+	if strings.Contains(remoteFile, "/") {
+		parts := strings.Split(remoteFile, "/")
+		// 最后一个部分是文件名
+		remoteFile = parts[len(parts)-1]
+		// 前面的部分是目录
+		remoteDir = fmt.Sprintf("%s/%s", remoteDir, strings.Join(parts[:len(parts)-1], "/"))
+	}
+
+	remoteFile = fmt.Sprintf("%s/%s", remoteDir, remoteFile)
+
+	return remoteDir, remoteFile
+}
+
+func (sf *sftpFinder) getRemoteFileSize(remoteFile string) (int64, error) {
+	// 尝试获取远程文件的 stat 信息
+	fileInfo, err := sf.client.Stat(remoteFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return fileInfo.Size(), nil
 }
 
 func (sf *sftpFinder) Index(ctx context.Context, adapter, path string) (Storages, error) {
@@ -421,7 +474,7 @@ func convertToFileInfo(file os.FileInfo, path, adapter string) FileInfo {
 		}(),
 		Path:          fmt.Sprintf("%s/%s", path, file.Name()),
 		Visibility:    "public",
-		LastModified:  file.ModTime(),
+		LastModified:  file.ModTime().Unix(),
 		MimeType:      mimeType,
 		ExtraMetadata: []string{},
 		Basename:      file.Name(),
