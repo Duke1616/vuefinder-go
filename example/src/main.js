@@ -1,5 +1,5 @@
 import { createApp } from "vue";
-import VueFinder from "vuefinder/dist/vuefinder";
+import VueFinder from 'vuefinder';
 import App from "./App.vue";
 import "vuefinder/dist/style.css";
 

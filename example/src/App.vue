@@ -1,81 +1,182 @@
 <template>
   <div class="wrapper">
     <vue-finder
+      ref="vuefinderRef"
       id="vuefinder"
-      :request="request"
-      locale="zhCN"
-      :full-screen="true"
-      :max-file-size="maxFileSize"
-      loadingIndicator="linear"
-      :select-button="handleSelectButton"
+      :driver="driver"
+      :config="{
+        theme: 'dark',
+        maxFileSize: '500mb',
+        fullScreen: true,
+      }"
+      :custom-uploader="customUploader"
     />
   </div>
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
+import { RemoteDriver } from 'vuefinder';
+import { WebSocketUploader } from './websocket-upload.js';
 
-const request = {
-  baseUrl: "http://127.0.0.1:8350/api/finder/index",
-  params: { id: 20 },
-  transformRequest: (req) => {
-    switch (req.params.q) {
-      case "upload":
-        req.url = "http://127.0.0.1:8350/api/finder/upload";
-        break;
-      case "download":
-        req.url = "http://127.0.0.1:8350/api/finder/download";
-        break;
-      case "rename":
-        req.url = "http://127.0.0.1:8350/api/finder/rename";
-        break;
-      case "newfile":
-        req.url = "http://127.0.0.1:8350/api/finder/new_file";
-        break;
-      case "newfolder":
-        req.url = "http://127.0.0.1:8350/api/finder/new_folder";
-        break;
-      case "delete":
-        req.url = "http://127.0.0.1:8350/api/finder/remove";
-        break;
-      case "subfolders":
-        req.url = "http://127.0.0.1:8350/api/finder/subfolders";
-        break;
-      case "move":
-        req.url = "http://127.0.0.1:8350/api/finder/move";
-        break;
-      case "archive":
-        req.url = "http://127.0.0.1:8350/api/finder/archive";
-        break;
-      case "search":
-        req.url = "http://127.0.0.1:8350/api/finder/search";
-        break;
-      case "preview":
-        req.url = "http://127.0.0.1:8350/api/finder/preview";
-        break;
-      case "save":
-        req.url = "http://127.0.0.1:8350/api/finder/save";
-        break;
-      default:
-        break;
+const vuefinderRef = ref(null);
+
+// 配置常量
+const BASE_URL = "http://127.0.0.1:8350/api/finder";
+const FINDER_ID = 20;
+
+// 扩展 RemoteDriver 以支持自定义下载
+class CustomRemoteDriver extends RemoteDriver {
+  async download(filePath, fileName) {
+    try {
+      const url = `${BASE_URL}/download?path=${encodeURIComponent(filePath)}`;
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-Finder-ID': String(FINDER_ID),
+        },
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || '下载失败');
+      }
+      
+      // 获取文件名
+      const contentDisposition = response.headers.get('Content-Disposition');
+      const finalFileName = contentDisposition
+        ? contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)?.[1]?.replace(/['"]/g, '') || fileName || filePath.split('/').pop()
+        : fileName || filePath.split('/').pop();
+      
+      // 下载文件
+      const blob = await response.blob();
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = finalFileName;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error('下载失败:', error);
+      alert(`下载失败: ${error.message}`);
+      throw error;
     }
-    return req;
+  }
+}
+
+// 使用自定义的 RemoteDriver
+const driver = new CustomRemoteDriver({
+  baseURL: BASE_URL,
+  headers: {
+    'X-Finder-ID': FINDER_ID,
   },
+  retry: 0,
+  url: {
+    list: '/files',
+    upload: '/upload',
+    delete: '/delete',
+    rename: '/rename',
+    copy: '/copy',
+    move: '/move',
+    archive: '/archive',
+    unarchive: '/unarchive',
+    createFile: '/new_file',
+    createFolder: '/new_folder',
+    preview: '/preview',
+    download: '/download',
+    search: '/search',
+    save: '/save',
+  },
+});
+
+// 创建 WebSocket 上传器实例
+const wsUploader = new WebSocketUploader(BASE_URL, FINDER_ID);
+
+// 使用 VueFinder 的 customUploader prop 配置 WebSocket 上传
+// 参考: https://github.com/n1crack/vuefinder/blob/master/docs/api-reference/props.md
+const customUploader = (uppy, context) => {  
+  // 监听上传事件
+  uppy.on('upload', async (fileIds) => {
+    const targetPath = context.getTargetPath() || '';
+    const allFiles = uppy.getFiles();
+    
+    // 获取要上传的文件列表（保留 fallback 逻辑）
+    const fileList = typeof fileIds === 'string'
+      ? (allFiles[fileIds] ? [allFiles[fileIds]] : Object.values(allFiles))
+      : Array.isArray(fileIds)
+        ? fileIds.map(id => allFiles[id]).filter(Boolean)
+        : Object.values(allFiles);
+    
+    // 使用 WebSocket 上传每个文件
+    for (const uppyFile of fileList) {
+      if (!uppyFile) continue;
+      
+      const file = uppyFile.data;
+      if (!file || !(file instanceof File)) {
+        uppy.emit('upload-error', uppyFile, new Error('无效的文件对象'));
+        continue;
+      }
+      
+      try {
+        await wsUploader.uploadFile(
+          file,
+          targetPath,
+          (progress) => {
+            uppy.emit('upload-progress', uppyFile, {
+              bytesUploaded: progress.bytesUploaded,
+              bytesTotal: progress.bytesTotal,
+            });
+          },
+          (data) => {
+            uppy.emit('upload-success', uppyFile, {
+              status: 200,
+              body: data,
+            });
+          },
+          (error) => {
+            uppy.emit('upload-error', uppyFile, error);
+          }
+        );
+      } catch (error) {
+        uppy.emit('upload-error', uppyFile, error);
+      }
+    }
+  });
 };
 
-const maxFileSize = ref("600MB");
-const handleSelectButton = {
-  active: true,
-  multiple: false,
-  click: (items, event) => {
-    if (!items.length) {
-      alert("No item selected");
-      return;
-    }
-    alert("Selected: " + items[0].path);
-    console.log(items, event);
-  },
+// 下载处理函数
+const handleDownload = async (filePath) => {
+  await driver.download(filePath);
 };
+
+// 下载链接点击处理函数
+const handleDownloadClick = async (event) => {
+  const target = event.target.closest('a');
+  if (!target) return;
+  
+  const href = target.getAttribute('href');
+  if (!href?.includes('/api/finder/download')) return;
+  
+  event.preventDefault();
+  event.stopPropagation();
+  
+  const url = new URL(href, window.location.origin);
+  const filePath = url.searchParams.get('path');
+  if (!filePath) return;
+  
+  await handleDownload(filePath);
+};
+
+onMounted(() => {
+  document.addEventListener('click', handleDownloadClick, true);
+});
+
+onUnmounted(() => {
+  document.removeEventListener('click', handleDownloadClick, true);
+});
 </script>
 
 <style lang="scss">
