@@ -198,7 +198,7 @@ func (sf *sftpFinder) Move(ctx context.Context, items []Item, target string) err
 
 		err := sf.client.Rename(actualItemPath, destPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to move %s to %s: %w", actualItemPath, destPath, err)
 		}
 	}
 
@@ -384,17 +384,26 @@ func parseVueFinderPath(path string) string {
 // formatVueFinderPath 将实际文件系统路径格式化为 vuefinder 格式 (sftp://path)
 func formatVueFinderPath(path string) string {
 	if strings.HasPrefix(path, pathPrefix) {
-		return path
+		// 如果已经是 sftp:// 格式，需要规范化路径部分
+		// 例如：sftp:///var -> sftp:///var, sftp:/// -> sftp:///
+		pathPart := strings.TrimPrefix(path, pathPrefix)
+		normalized := normalizePath(pathPart)
+		return pathPrefix + normalized
 	}
-	return pathPrefix + normalizePath(path)
+	// normalizePath 已经确保路径以 / 开头，所以直接拼接
+	normalized := normalizePath(path)
+	return pathPrefix + normalized
 }
 
 // normalizePath 规范化路径，确保以 / 开头且没有多余的斜杠
 func normalizePath(path string) string {
+	// 移除开头的所有斜杠
 	path = strings.TrimLeft(path, "/")
 	if path == "" {
 		return "/"
 	}
+	// 移除路径中多余的连续斜杠，并确保以 / 开头
+	path = strings.ReplaceAll(path, "//", "/")
 	return "/" + path
 }
 
@@ -403,7 +412,9 @@ func (sf *sftpFinder) Index(ctx context.Context, path string) (Storages, error) 
 	actualPath, dirName := sf.resolvePath(path)
 
 	// storages 始终返回所有根目录列表，用于左侧导航栏显示
-	// 前端会根据当前路径自动展开/折叠对应的目录树
+	// vuefinder 4.0 的左侧导航栏会遍历 storages 数组，显示每个根目录
+	// 当点击某个根目录时，前端会调用 list(storage + "://") 来获取该目录下的内容
+	// 每次 list 调用后，前端会调用 setStorages 更新 storages，所以需要始终返回所有根目录列表
 	storages, err := sf.findStorage()
 	if err != nil {
 		return Storages{}, err
@@ -479,11 +490,16 @@ func convertToFileInfo(file os.FileInfo, basePath string) FileInfo {
 	filePath = normalizePath(filePath)
 	filePath = formatVueFinderPath(filePath)
 
+	// 获取文件所在目录路径（Dir 字段）
+	dirPath := normalizePath(basePath)
+	dirPath = formatVueFinderPath(dirPath)
+
 	// 确定文件类型
 	fileType := determineFileType(file, basePath)
 
 	return FileInfo{
 		Type:          fileType,
+		Dir:           dirPath,
 		Path:          filePath,
 		Visibility:    "public",
 		LastModified:  file.ModTime().Unix(),
@@ -562,48 +578,23 @@ func getLinkType(file os.FileInfo, basePath string) (FileType, error) {
 func (sf *sftpFinder) scanFiles(path string) ([]FileInfo, error) {
 	fileInfos := make([]FileInfo, 0)
 
-	// 如果不是根目录，添加 "." 和 ".." 目录
-	if !isRootPath(path) {
-		parentPath := filepath.Dir(path)
-		fileInfos = append(fileInfos,
-			createDotDir(path),
-			createDotDotDir(parentPath),
-		)
-	}
-
 	// 扫描目录下的文件
 	files, err := sf.scan(path)
 	if err != nil {
 		return nil, err
 	}
 
-	fileInfos = append(fileInfos, files...)
+	// 过滤掉 "." 和 ".." 目录，避免前端渲染时出现循环引用
+	filteredFiles := make([]FileInfo, 0, len(files))
+	for _, file := range files {
+		if file.Basename != "." && file.Basename != ".." {
+			filteredFiles = append(filteredFiles, file)
+		}
+	}
+
+	fileInfos = append(fileInfos, filteredFiles...)
+
 	return fileInfos, nil
-}
-
-// createDotDir 创建当前目录 "." 的 FileInfo
-func createDotDir(path string) FileInfo {
-	return FileInfo{
-		Basename: ".",
-		Type:     DIR,
-		Path:     formatVueFinderPath(path),
-		Storage:  storageName,
-	}
-}
-
-// createDotDotDir 创建父目录 ".." 的 FileInfo
-func createDotDotDir(parentPath string) FileInfo {
-	return FileInfo{
-		Basename: "..",
-		Type:     DIR,
-		Path:     formatVueFinderPath(parentPath),
-		Storage:  storageName,
-	}
-}
-
-// isRootPath 判断是否为根路径
-func isRootPath(path string) bool {
-	return strings.Count(path, "/") == 1
 }
 
 func blockOperation(action string, oldFile, newFile string) bool {

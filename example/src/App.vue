@@ -32,6 +32,7 @@ const driver = new RemoteDriver({
   headers: {
     'X-Finder-ID': 20,
   },
+  retry: 0,
   url: {
     list: '/files',
     upload: '/upload',

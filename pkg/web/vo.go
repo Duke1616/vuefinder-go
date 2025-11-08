@@ -36,13 +36,16 @@ type RenameReq struct {
 
 type ArchiveReq struct {
 	Name  string `json:"name"`
+	Path  string `json:"path"`
 	Items []Item `json:"items"`
 }
 
 type MoveReq struct {
-	Path  string `json:"path"`
-	Item  string `json:"item"`
-	Items []Item `json:"items"`
+	Path        string   `json:"path"`
+	Item        string   `json:"item"`        // 目标路径（destination）
+	Items       []Item   `json:"items"`       // 源文件列表（sources）
+	Destination string   `json:"destination"` // 目标路径（前端可能使用这个字段）
+	Sources     []string `json:"sources"`     // 源文件列表（前端发送的是字符串数组）
 }
 
 type SaveReq struct {

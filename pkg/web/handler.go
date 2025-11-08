@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
@@ -88,11 +89,14 @@ func (h *Handler) Preview(ctx *gin.Context) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
+	// 先获取字节数据，避免多次读取
+	data := buff.Bytes()
+
 	// 根据文件类型设置响应的 Content-Type
-	contentType := http.DetectContentType(buff.Bytes())
+	contentType := http.DetectContentType(data)
 	ctx.Header("Content-Type", contentType)
 
-	return ginx.Result{Message: "OK", Data: buff.String()}, nil
+	return ginx.Result{Message: "OK", Data: string(data)}, nil
 }
 
 func (h *Handler) Search(ctx *gin.Context) (ginx.Result, error) {
@@ -116,18 +120,34 @@ func (h *Handler) Search(ctx *gin.Context) (ginx.Result, error) {
 }
 
 func (h *Handler) Archive(ctx *gin.Context, req ArchiveReq) (ginx.Result, error) {
-	pathQuery := ctx.Query("path")
+	// 使用 req.Path，如果没有则从 query 参数获取
+	basePath := req.Path
+	if basePath == "" {
+		basePath = ctx.Query("path")
+	}
+
+	// 构建完整的目标路径：basePath + "/" + name + ".zip"
+	// 如果 name 已经包含 .zip 扩展名，则不需要再添加
+	targetPath := basePath
+	if targetPath != "" && !strings.HasSuffix(targetPath, "/") {
+		targetPath += "/"
+	}
+	targetPath += req.Name
+	if !strings.HasSuffix(targetPath, ".zip") {
+		targetPath += ".zip"
+	}
 
 	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
-	err = fd.Archive(ctx, toFinderItems(req.Items), req.Name, pathQuery)
+
+	err = fd.Archive(ctx, toFinderItems(req.Items), targetPath, basePath)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, pathQuery)
+	storage, err := fd.Index(ctx, basePath)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -138,12 +158,46 @@ func (h *Handler) Archive(ctx *gin.Context, req ArchiveReq) (ginx.Result, error)
 }
 
 func (h *Handler) Move(ctx *gin.Context, req MoveReq) (ginx.Result, error) {
+	// 兼容前端可能使用的不同字段名
+	// 优先使用 sources/destination，如果没有则使用 items/item
+	var items []Item
+	var target string
+
+	// 如果 sources 是字符串数组，需要转换为 Item 数组
+	if len(req.Sources) > 0 {
+		items = make([]Item, 0, len(req.Sources))
+		for _, sourcePath := range req.Sources {
+			// 从路径推断类型（这里简化处理，实际可能需要查询文件系统）
+			// 暂时都设置为 FILE，如果需要可以后续优化
+			items = append(items, Item{
+				Path: sourcePath,
+				Type: finder.FILE, // 默认类型，可以根据需要调整
+			})
+		}
+	} else {
+		items = req.Items
+	}
+
+	if req.Destination != "" {
+		target = req.Destination
+	} else {
+		target = req.Item
+	}
+
+	if len(items) == 0 {
+		return ginx.Result{Message: "no items to move"}, fmt.Errorf("no items to move")
+	}
+
+	if target == "" {
+		return ginx.Result{Message: "destination is required"}, fmt.Errorf("destination is required")
+	}
+
 	fd, err := h.getFinder(ctx)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Move(ctx, toFinderItems(req.Items), req.Item)
+	err = fd.Move(ctx, toFinderItems(items), target)
 
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
