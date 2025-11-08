@@ -3,6 +3,7 @@ package finder
 import (
 	"bytes"
 	"context"
+	"io"
 	"mime/multipart"
 )
 
@@ -18,6 +19,7 @@ const (
 type Finder interface {
 	Index(ctx context.Context, path string) (Storages, error)
 	Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error
+	UploadStream(ctx context.Context, src io.Reader, remoteDir, remoteFile string) error
 	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
@@ -60,17 +62,9 @@ type Item struct {
 }
 
 func (f FileType) IsDir() bool {
-	if f == DIR {
-		return true
-	}
-
-	return false
+	return f == DIR
 }
 
 func (f FileType) IsFile() bool {
-	if f == FILE {
-		return true
-	}
-
-	return false
+	return f == FILE
 }

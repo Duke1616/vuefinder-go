@@ -143,3 +143,28 @@ func WrapBody[Req any](fn func(ctx *gin.Context, req Req) (Result, error)) gin.H
 		ctx.PureJSON(http.StatusOK, res.Data)
 	}
 }
+
+// WrapUpload 专门用于文件上传的包装函数，确保响应格式正确
+// 注意：上传进度由浏览器的 XMLHttpRequest 自动处理，不需要后端特殊处理
+// uppy 期望服务器返回 JSON 格式的响应，可以是任何有效的 JSON 对象
+func WrapUpload(fn func(ctx *gin.Context) (Result, error)) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		res, err := fn(ctx)
+		if err != nil {
+			slog.Error("上传文件失败", slog.Any("err", err))
+			errorRes := Result{
+				Code:    0,
+				Message: res.Message,
+				Data:    nil,
+			}
+			if errorRes.Message == "" {
+				errorRes.Message = err.Error()
+			}
+			ctx.PureJSON(http.StatusInternalServerError, errorRes)
+			return
+		}
+		// 返回完整的 Result 对象
+		// uppy 会解析响应，但上传进度是由浏览器自动报告的，不依赖响应内容
+		ctx.PureJSON(http.StatusOK, res)
+	}
+}

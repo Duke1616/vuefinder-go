@@ -298,6 +298,19 @@ func (sf *sftpFinder) Download(ctx context.Context, filePath string) (bytes.Buff
 }
 
 func (sf *sftpFinder) Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error {
+	// 打开源文件
+	srcFile, err := src.Open()
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// 使用流式上传
+	return sf.UploadStream(ctx, srcFile, remoteDir, remoteFile)
+}
+
+// UploadStream 流式上传文件，边接收边写入，不等待整个文件上传完成
+func (sf *sftpFinder) UploadStream(ctx context.Context, src io.Reader, remoteDir, remoteFile string) error {
 	// 解析路径为实际文件系统路径
 	actualRemoteDir := parseVueFinderPath(remoteDir)
 
@@ -320,13 +333,6 @@ func (sf *sftpFinder) Upload(ctx context.Context, src *multipart.FileHeader, rem
 		}
 	}
 
-	// 打开源文件
-	srcFile, err := src.Open()
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
 	// 创建并打开目标文件
 	dstFile, err := sf.client.Create(targetPath)
 	if err != nil {
@@ -334,21 +340,17 @@ func (sf *sftpFinder) Upload(ctx context.Context, src *multipart.FileHeader, rem
 	}
 	defer dstFile.Close()
 
-	// 缓冲区读取并写入 4MB
-	buffer := make([]byte, 4*1024*1024)
-	for {
-		n, readErr := srcFile.Read(buffer)
-		if n > 0 {
-			if _, writeErr := dstFile.Write(buffer[:n]); writeErr != nil {
-				return writeErr
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
+	// 使用 io.CopyBuffer 进行流式复制，缓冲区大小为 256KB
+	// 256KB 是 32KB (SFTP MaxPacketSize) 的 8 倍，可以减少系统调用次数
+	// 同时不会占用太多内存，是一个较好的平衡点
+	buffer := make([]byte, 256*1024)
+
+	// 直接复制，不调用 Sync() 以提高性能
+	// Sync() 会强制刷新到磁盘，但会显著降低性能
+	// 文件关闭时会自动刷新，不需要手动 Sync
+	_, err = io.CopyBuffer(dstFile, src, buffer)
+	if err != nil {
+		return err
 	}
 
 	return nil

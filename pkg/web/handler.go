@@ -24,6 +24,20 @@ func NewHandler() *Handler {
 	}
 }
 
+// RegisterUploadRoute 单独注册上传路由，在中间件之前
+// 使用流式上传以支持实时进度显示
+func (h *Handler) RegisterUploadRoute(server *gin.Engine) {
+	// HTTP 流式上传（保留作为备选）
+	server.Any("/api/finder/upload", func(ctx *gin.Context) {
+		StreamingUploadHandler(h)(ctx.Writer, ctx.Request)
+	})
+
+	// WebSocket 上传（支持实时进度和双向通信）
+	server.GET("/api/finder/upload/ws", func(ctx *gin.Context) {
+		WebSocketUploadHandler(h)(ctx.Writer, ctx.Request)
+	})
+}
+
 func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g := server.Group("/api/finder")
 
@@ -31,7 +45,7 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.GET("/download", ginx.WrapData(h.Download))
 	g.GET("/search", ginx.Wrap(h.Search))
 	g.GET("/preview", ginx.WrapBuff(h.Preview))
-	g.POST("/upload", ginx.Wrap(h.Upload))
+	// 注意：上传路由已经在 RegisterUploadRoute 中注册（流式上传，支持实时进度）
 	g.POST("/new_folder", ginx.WrapBody(h.NewFolder))
 	g.POST("/new_file", ginx.WrapBody(h.NewFile))
 	g.POST("/rename", ginx.WrapBody(h.Rename))
@@ -310,9 +324,20 @@ func (h *Handler) Download(ctx *gin.Context) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
+	// 解析路径获取文件名
+	actualPath := file
+	if strings.Contains(file, "://") {
+		parts := strings.SplitN(file, "://", 2)
+		if len(parts) > 1 {
+			actualPath = parts[1]
+		}
+	}
+	fileName := path.Base(actualPath)
+
+	// 设置响应头
 	ctx.Header("Content-Description", "File Transfer")
 	ctx.Header("Content-Transfer-Encoding", "binary")
-	ctx.Header("Content-Disposition", "attachment; filename="+path.Base(file))
+	ctx.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
 	ctx.Header("Content-Type", "application/octet-stream")
 
 	return ginx.Result{
@@ -321,30 +346,60 @@ func (h *Handler) Download(ctx *gin.Context) (ginx.Result, error) {
 }
 
 func (h *Handler) Upload(ctx *gin.Context) (ginx.Result, error) {
-	// 文件名称
+	// 直接使用 FormFile 方式
+	// 注意：Gin 的 FormFile 会等待整个文件上传完成，但这是 Gin 框架的限制
+	// 真正的流式处理需要绕过 Gin 的 multipart 解析，实现起来比较复杂且容易出错
+	// 当前实现虽然需要等待文件上传完成，但写入是流式的，不会占用太多内存
+	return h.uploadWithFormFile(ctx)
+}
+
+// uploadWithFormFile 回退方案：使用 FormFile 方式上传
+func (h *Handler) uploadWithFormFile(ctx *gin.Context) (ginx.Result, error) {
+	// 文件名称和路径
 	remoteFile, _ := ctx.GetPostForm("name")
 	remoteDir, _ := ctx.GetPostForm("path")
 
-	// 读取文件
-	srcFile, err := ctx.FormFile("file")
+	// 使用 FormFile 读取文件
+	srcFileHeader, err := ctx.FormFile("file")
 	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+		return ginx.Result{Message: fmt.Sprintf("获取文件失败: %v", err)}, err
 	}
 
-	fmt.Printf("srcFile: %+v\n", srcFile)
+	// 如果没有提供文件名，使用上传的文件名
+	if remoteFile == "" {
+		remoteFile = srcFileHeader.Filename
+		if remoteFile == "" {
+			remoteFile = "uploaded_file"
+		}
+	}
 
 	fd, err := h.getFinder(ctx)
 	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+		return ginx.Result{Message: fmt.Sprintf("获取 Finder 失败: %v", err)}, err
 	}
 
-	err = fd.Upload(ctx, srcFile, remoteDir, remoteFile)
+	// 打开文件流进行流式上传
+	srcFile, err := srcFileHeader.Open()
 	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+		return ginx.Result{Message: fmt.Sprintf("打开文件流失败: %v", err)}, err
+	}
+	defer srcFile.Close()
+
+	// 使用流式上传
+	err = fd.UploadStream(ctx, srcFile, remoteDir, remoteFile)
+	if err != nil {
+		return ginx.Result{Message: fmt.Sprintf("上传文件失败: %v", err)}, err
+	}
+
+	// 上传成功后，返回当前目录的文件列表，以便前端刷新
+	storage, err := fd.Index(ctx, remoteDir)
+	if err != nil {
+		return ginx.Result{Message: fmt.Sprintf("获取文件列表失败: %v", err)}, err
 	}
 
 	return ginx.Result{
 		Message: "File uploaded!",
+		Data:    storage,
 	}, nil
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -73,7 +74,10 @@ func run(cmd *cobra.Command, args []string) {
 	}
 	defer client.Close()
 
-	sftpClient, err := sftp.NewClient(client)
+	// 优化 SFTP 客户端配置以提高性能
+	// MaxPacketSize: 32768 (32KB) - 使用默认值以确保兼容性
+	// MaxConcurrentRequestsPerFile: 64 - 增加并发请求数以提高性能
+	sftpClient, err := sftp.NewClient(client, sftp.MaxConcurrentRequestsPerFile(64))
 	if err != nil {
 		log.Fatalf("Failed to create SFTP client: %v", err)
 	}
@@ -84,12 +88,30 @@ func run(cmd *cobra.Command, args []string) {
 	handler.SetFinder(20, f)
 	mlds := ginx.NewMiddleware()
 	engine := gin.Default()
+
+	// 设置最大上传文件大小为 500MB，支持大文件上传
+	// 超过此大小的文件会使用临时文件而不是内存
+	engine.MaxMultipartMemory = 500 << 20 // 500MB
+
+	// 先注册上传路由（在中间件之前），避免中间件读取请求体
+	// 注意：流式上传需要直接访问原始请求体，不能被中间件读取
+	handler.RegisterUploadRoute(engine)
+
+	// 然后注册中间件和其他路由
 	engine.Use(mlds...)
 	handler.RegisterRoutes(engine)
 
 	log.Printf("Starting server on :8350")
 	log.Printf("Connected to SSH server: %s@%s", user, host)
-	if err := engine.Run(":8350"); err != nil {
+
+	// 创建 HTTP 服务器
+	srv := &http.Server{
+		Addr:    ":8350",
+		Handler: engine,
+	}
+
+	// 启动服务器
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

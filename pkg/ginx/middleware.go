@@ -13,7 +13,7 @@ func corsHdl() gin.HandlerFunc {
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"POST", "GET", "PUT", "DELETE", "PATCH", "OPTIONS"},
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-Finder-ID", "X-Finder-Id"},
-		ExposeHeaders:    []string{"x-jwt-token", "x-refresh-token"},
+		ExposeHeaders:    []string{"x-jwt-token", "x-refresh-token", "Content-Length", "Content-Type"},
 		AllowCredentials: true,
 		AllowOriginFunc: func(origin string) bool {
 			if strings.HasPrefix(origin, "http://localhost") {
