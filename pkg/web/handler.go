@@ -28,7 +28,7 @@ func NewHandler() *Handler {
 // 使用流式上传以支持实时进度显示
 func (h *Handler) RegisterUploadRoute(server *gin.Engine) {
 	// HTTP 流式上传（保留作为备选）
-	server.Any("/api/finder/upload", func(ctx *gin.Context) {
+	server.POST("/api/finder/upload", func(ctx *gin.Context) {
 		StreamingUploadHandler(h)(ctx.Writer, ctx.Request)
 	})
 
