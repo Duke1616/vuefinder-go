@@ -2,18 +2,53 @@
   <div class="wrapper">
     <vue-finder
       id="vuefinder"
-      :request="request"
-      locale="zhCN"
-      :full-screen="true"
-      :max-file-size="maxFileSize"
-      loadingIndicator="linear"
-      :select-button="handleSelectButton"
+      :driver="driver"
+      :config="{
+        theme: 'dark',
+        maxFileSize: '500mb',
+        fullScreen: true,
+      }"
     />
   </div>
 </template>
 
+<!-- :full-screen="true"
+:max-file-size="maxFileSize"
+loadingIndicator="linear"
+:select-button="handleSelectButton" -->
+
 <script setup>
 import { ref } from "vue";
+import { RemoteDriver } from 'vuefinder';
+
+// 简单的实现：重写 request 方法，所有请求自动添加 id 参数
+// class CustomRemoteDriver extends RemoteDriver {
+//   async request(url, options = {}) {
+//     const separator = url.includes('?') ? '&' : '?';
+
+
+const driver = new RemoteDriver({
+  baseURL: "http://127.0.0.1:8350/api/finder",
+  headers: {
+    'X-Finder-ID': 20,
+  },
+  url: {
+    list: '/files',
+    upload: '/upload',
+    delete: '/delete',
+    rename: '/rename',
+    copy: '/copy',
+    move: '/move',
+    archive: '/archive',
+    unarchive: '/unarchive',
+    createFile: '/new_file',
+    createFolder: '/new_folder',
+    preview: '/preview',
+    download: '/download',
+    search: '/search',
+    save: '/save',
+  },
+});
 
 const request = {
   baseUrl: "http://127.0.0.1:8350/api/finder/index",
