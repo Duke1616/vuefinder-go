@@ -27,10 +27,8 @@ const (
 	wsMsgTypeError    = "error"    // 上传失败
 
 	// WebSocket 配置常量
-	readDeadline       = 60 * time.Second // 读取超时时间
-	messageQueueSize   = 100              // 消息队列大小
-	logProgressEvery   = 1024 * 1024      // 每 1MB 记录一次进度日志
-	logProgressPercent = 10               // 每 10% 记录一次进度日志
+	readDeadline     = 60 * time.Second // 读取超时时间
+	messageQueueSize = 100              // 消息队列大小
 )
 
 // UploadMessage WebSocket 消息结构
@@ -51,15 +49,14 @@ type UploadMessage struct {
 
 // UploadSession 上传会话
 type UploadSession struct {
-	ID                string
-	FileName          string
-	Path              string
-	Size              int64
-	Writer            io.WriteCloser
-	Finder            finder.Finder
-	Offset            int64
-	lastLoggedPercent int          // 上次记录的百分比（用于控制日志频率）
-	mu                sync.RWMutex // 保护 Offset 的并发访问
+	ID       string
+	FileName string
+	Path     string
+	Size     int64
+	Writer   io.WriteCloser
+	Finder   finder.Finder
+	Offset   int64
+	mu       sync.RWMutex // 保护 Offset 的并发访问
 }
 
 // uploadWriter 实现 io.WriteCloser，用于流式写入到 SFTP
@@ -181,6 +178,16 @@ var upgrader = websocket.Upgrader{
 		// 允许所有来源，生产环境应该限制
 		return true
 	},
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
+
+// getFinderID 从请求中获取 finder ID
+func getFinderID(r *http.Request) string {
+	if id := r.URL.Query().Get("id"); id != "" {
+		return id
+	}
+	return r.Header.Get("x-finder-id")
 }
 
 // UploadHandler 处理 WebSocket 文件上传
@@ -195,10 +202,7 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 		defer conn.Close()
 
 		// 获取 finder ID
-		finderID := r.URL.Query().Get("id")
-		if finderID == "" {
-			finderID = r.Header.Get("x-finder-id")
-		}
+		finderID := getFinderID(r)
 		if finderID == "" {
 			sendErrorSync(conn, "", "finder id is required")
 			return
@@ -236,11 +240,11 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 		sessionsMu := sync.RWMutex{}
 
 		// 设置读取超时和关闭处理
-		if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		if err = conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
 			slog.Warn("设置读取超时失败", slog.Any("err", err))
 		}
 		conn.SetPongHandler(func(string) error {
-			if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+			if err = conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
 				slog.Warn("重置读取超时失败", slog.Any("err", err))
 			}
 			return nil
@@ -252,7 +256,7 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 		// 读取消息循环
 		for {
 			var msg UploadMessage
-			err := conn.ReadJSON(&msg)
+			err = conn.ReadJSON(&msg)
 			if err != nil {
 				// 检查是否是正常的关闭错误
 				if isNormalClose(err) {
@@ -266,22 +270,20 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 			}
 
 			// 重置读取超时
-			if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+			if err = conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
 				slog.Warn("重置读取超时失败", slog.Any("err", err))
 			}
 
 			switch msg.Type {
 			case wsMsgTypeStart:
 				// 开始上传
-				err := handleStartUpload(ctx, msgChan, &msg, fd, sessions, &sessionsMu)
-				if err != nil {
+				if err = handleStartUpload(ctx, msgChan, &msg, fd, sessions, &sessionsMu); err != nil {
 					slog.Error("处理开始上传失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 				}
 			case wsMsgTypeChunk:
 				// 文件数据块
-				err := handleChunk(msgChan, &msg, sessions, &sessionsMu)
-				if err != nil {
+				if err = handleChunk(msgChan, &msg, sessions, &sessionsMu); err != nil {
 					slog.Error("处理数据块失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 					// 清理会话
@@ -289,8 +291,7 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 				}
 			case wsMsgTypeEnd:
 				// 上传结束
-				err := handleEndUpload(ctx, msgChan, &msg, sessions, &sessionsMu)
-				if err != nil {
+				if err = handleEndUpload(ctx, msgChan, &msg, sessions, &sessionsMu); err != nil {
 					slog.Error("处理上传结束失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 				}
@@ -348,8 +349,8 @@ func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *U
 
 	// 设置进度回调，通过 WebSocket 发送进度更新
 	// 注意：需要在 Close() 之前设置，因为 Close() 会触发 SFTP 写入
-	if uploadWriter, ok := writer.(*uploadWriter); ok {
-		uploadWriter.SetProgressCallback(func(written, total int64) {
+	if uploader, ok := writer.(*uploadWriter); ok {
+		uploader.SetProgressCallback(func(written, total int64) {
 			// 读取当前接收进度（需要加锁）
 			session.mu.RLock()
 			offset := session.Offset
@@ -391,7 +392,6 @@ func handleChunk(msgChan chan<- UploadMessage, msg *UploadMessage, sessions map[
 	}
 
 	// 解码 base64 数据
-	// msg.Data 是 json.RawMessage，需要先解析为字符串
 	var base64Str string
 	if err := json.Unmarshal(msg.Data, &base64Str); err != nil {
 		return fmt.Errorf("解析 base64 数据失败: %w", err)
@@ -412,23 +412,12 @@ func handleChunk(msgChan chan<- UploadMessage, msg *UploadMessage, sessions map[
 	session.mu.Lock()
 	session.Offset += int64(n)
 	offset := session.Offset
-	lastLoggedPercent := session.lastLoggedPercent
 	session.mu.Unlock()
 
 	// 获取已写入 SFTP 的字节数（实时进度）
 	var sftpWritten int64
 	if writer, ok := session.Writer.(*uploadWriter); ok {
 		sftpWritten = writer.GetSFTPWritten()
-	}
-
-	// 更新上次记录的百分比（用于控制日志频率，但不再记录日志）
-	percent := float64(offset) / float64(session.Size) * 100
-	currentLoggedPercent := int(percent/float64(logProgressPercent)) * logProgressPercent
-
-	if currentLoggedPercent != lastLoggedPercent {
-		session.mu.Lock()
-		session.lastLoggedPercent = currentLoggedPercent
-		session.mu.Unlock()
 	}
 
 	// 发送进度更新，包含 SFTP 写入进度
@@ -501,16 +490,6 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 	return nil
 }
 
-// sendMessage 通过消息队列发送消息
-func sendMessage(msgChan chan<- UploadMessage, msg UploadMessage) error {
-	select {
-	case msgChan <- msg:
-		return nil
-	default:
-		return fmt.Errorf("消息队列已满")
-	}
-}
-
 // sendError 通过消息队列发送错误消息
 func sendError(msgChan chan<- UploadMessage, id, errorMsg string) {
 	select {
@@ -542,23 +521,6 @@ func isNormalClose(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	// 检查是否是正常的关闭错误
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		return true
-	}
-
-	// 检查是否是 1005 (no status) 错误
-	// 这通常发生在客户端正常关闭连接时
-	errStr := err.Error()
-	if errStr == "websocket: close 1005 (no status)" {
-		return true
-	}
-
-	// 检查是否包含 "1005" 或 "no status"
-	if websocket.IsCloseError(err, 1005) {
-		return true
-	}
-
-	return false
+	// 检查是否是正常的关闭错误（1000 或 1005）
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, 1005)
 }

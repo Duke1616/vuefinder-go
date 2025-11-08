@@ -20,7 +20,8 @@ type Finder interface {
 	Index(ctx context.Context, path string) (Storages, error)
 	Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error
 	UploadStream(ctx context.Context, src io.Reader, remoteDir, remoteFile string) error
-	UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string, totalSize int64, onProgress func(written, total int64)) error
+	UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string,
+		totalSize int64, onProgress func(written, total int64)) error
 	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
@@ -28,6 +29,7 @@ type Finder interface {
 	RemoveDir(ctx context.Context, file string) error
 	RemoveFile(ctx context.Context, file string) error
 	Archive(ctx context.Context, items []Item, target, base string) error
+	Unarchive(ctx context.Context, archivePath, targetDir string) error
 	Move(ctx context.Context, items []Item, target string) error
 	Preview(ctx context.Context, path string) (bytes.Buffer, error)
 	Delete(ctx context.Context, items []Item, path string) error

@@ -51,6 +51,7 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.POST("/rename", ginx.WrapBody(h.Rename))
 	g.POST("/move", ginx.WrapBody(h.Move))
 	g.POST("/archive", ginx.WrapBody(h.Archive))
+	g.POST("/unarchive", ginx.WrapBody(h.Unarchive))
 	g.POST("/save", ginx.WrapBuffBody(h.Save))
 	g.DELETE("/delete", ginx.WrapBody(h.Delete))
 }
@@ -162,6 +163,35 @@ func (h *Handler) Archive(ctx *gin.Context, req ArchiveReq) (ginx.Result, error)
 	}
 
 	storage, err := fd.Index(ctx, basePath)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	return ginx.Result{
+		Data: storage,
+	}, nil
+}
+
+func (h *Handler) Unarchive(ctx *gin.Context, req UnarchiveReq) (ginx.Result, error) {
+	if req.Item == "" {
+		return ginx.Result{Message: "item is required"}, fmt.Errorf("item is required")
+	}
+
+	if req.Path == "" {
+		return ginx.Result{Message: "path is required"}, fmt.Errorf("path is required")
+	}
+
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	err = fd.Unarchive(ctx, req.Item, req.Path)
+	if err != nil {
+		return ginx.Result{Message: err.Error()}, err
+	}
+
+	storage, err := fd.Index(ctx, req.Path)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}

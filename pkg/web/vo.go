@@ -40,6 +40,11 @@ type ArchiveReq struct {
 	Items []Item `json:"items"`
 }
 
+type UnarchiveReq struct {
+	Item string `json:"item"` // 要解压的文件路径
+	Path string `json:"path"` // 解压到的目标目录
+}
+
 type MoveReq struct {
 	Path        string   `json:"path"`
 	Item        string   `json:"item"`        // 目标路径（destination）

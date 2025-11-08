@@ -127,6 +127,94 @@ func (sf *sftpFinder) Archive(ctx context.Context, items []Item, target, base st
 	return nil
 }
 
+func (sf *sftpFinder) Unarchive(ctx context.Context, archivePath, targetDir string) error {
+	// 解析路径为实际文件系统路径
+	actualArchivePath := parseVueFinderPath(archivePath)
+	actualTargetDir := parseVueFinderPath(targetDir)
+
+	// 打开 ZIP 文件
+	zipFile, err := sf.client.Open(actualArchivePath)
+	if err != nil {
+		return fmt.Errorf("打开压缩文件失败: %w", err)
+	}
+	defer zipFile.Close()
+
+	// 获取文件大小
+	fileInfo, err := zipFile.Stat()
+	if err != nil {
+		return fmt.Errorf("获取文件信息失败: %w", err)
+	}
+
+	// 读取 ZIP 文件内容到内存
+	zipData := make([]byte, fileInfo.Size())
+	_, err = io.ReadFull(zipFile, zipData)
+	if err != nil {
+		return fmt.Errorf("读取压缩文件失败: %w", err)
+	}
+
+	// 创建 ZIP Reader
+	zipReader, err := zip.NewReader(bytes.NewReader(zipData), fileInfo.Size())
+	if err != nil {
+		return fmt.Errorf("解析压缩文件失败: %w", err)
+	}
+
+	// 遍历 ZIP 文件中的每个条目
+	for _, file := range zipReader.File {
+		// 清理文件名：移除 Windows 路径分隔符，防止路径遍历
+		cleanName := strings.ReplaceAll(file.Name, "\\", "/")
+		cleanName = strings.TrimPrefix(cleanName, "/")
+
+		// 安全检查：防止路径遍历攻击
+		if strings.Contains(cleanName, "..") {
+			continue
+		}
+
+		// 构建目标文件路径
+		targetPath := filepath.Join(actualTargetDir, cleanName)
+		targetPath = normalizePath(targetPath)
+
+		// 如果是目录
+		if file.FileInfo().IsDir() {
+			err = sf.client.MkdirAll(targetPath)
+			if err != nil {
+				return fmt.Errorf("创建目录失败 %s: %w", targetPath, err)
+			}
+			continue
+		}
+
+		// 确保父目录存在
+		parentDir := filepath.Dir(targetPath)
+		err = sf.client.MkdirAll(parentDir)
+		if err != nil {
+			return fmt.Errorf("创建父目录失败 %s: %w", parentDir, err)
+		}
+
+		// 打开 ZIP 文件中的文件
+		rc, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("打开压缩文件中的文件失败 %s: %w", file.Name, err)
+		}
+
+		// 创建目标文件
+		targetFile, err := sf.client.Create(targetPath)
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("创建目标文件失败 %s: %w", targetPath, err)
+		}
+
+		// 复制文件内容
+		_, err = io.Copy(targetFile, rc)
+		rc.Close()
+		targetFile.Close()
+
+		if err != nil {
+			return fmt.Errorf("写入文件失败 %s: %w", targetPath, err)
+		}
+	}
+
+	return nil
+}
+
 func (sf *sftpFinder) walkAndZip(path string, zipWriter *zip.Writer, basePath string) error {
 	info, err := sf.client.Stat(path)
 	if err != nil {
@@ -358,7 +446,8 @@ func (sf *sftpFinder) UploadStream(ctx context.Context, src io.Reader, remoteDir
 }
 
 // UploadStreamWithProgress 流式上传文件，支持进度回调
-func (sf *sftpFinder) UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string, totalSize int64, onProgress func(written, total int64)) error {
+func (sf *sftpFinder) UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string,
+	totalSize int64, onProgress func(written, total int64)) error {
 	// 解析路径为实际文件系统路径
 	actualRemoteDir := parseVueFinderPath(remoteDir)
 
