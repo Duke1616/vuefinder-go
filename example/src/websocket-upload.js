@@ -55,12 +55,23 @@ export class WebSocketUploader {
             const percent = ((msg.offset / msg.size) * 100).toFixed(2);
             const uploadedMB = (msg.offset / 1024 / 1024).toFixed(2);
             const totalMB = (msg.size / 1024 / 1024).toFixed(2);
-            console.log(`[WebSocket上传] 进度: ${percent}% (${uploadedMB} MB / ${totalMB} MB)`);
+            
+            // SFTP 写入进度
+            const sftpWritten = msg.sftpWritten || 0;
+            const sftpPercent = sftpWritten > 0 ? ((sftpWritten / msg.size) * 100).toFixed(2) : '0.00';
+            const sftpMB = (sftpWritten / 1024 / 1024).toFixed(2);
+            
+            console.log(`[WebSocket上传] 接收进度: ${percent}% (${uploadedMB} MB / ${totalMB} MB)`);
+            if (sftpWritten > 0) {
+              console.log(`[WebSocket上传] SFTP写入进度: ${sftpPercent}% (${sftpMB} MB / ${totalMB} MB)`);
+            }
             
             if (onProgress) {
               onProgress({
                 bytesUploaded: msg.offset,
                 bytesTotal: msg.size,
+                sftpWritten: sftpWritten,
+                sftpPercent: sftpPercent,
               });
             }
           } else if (msg.type === 'success') {

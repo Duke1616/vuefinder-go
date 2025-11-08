@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
@@ -34,7 +35,8 @@ type WebSocketUploadMessage struct {
 	Path              string          `json:"path"`              // 目标路径
 	Data              json.RawMessage `json:"data"`              // 数据（base64 编码的文件块或元数据）
 	Size              int64           `json:"size"`              // 文件总大小
-	Offset            int64           `json:"offset"`            // 当前偏移量
+	Offset            int64           `json:"offset"`            // 当前偏移量（已接收的字节数）
+	SFTPWritten       int64           `json:"sftpWritten"`       // 已写入 SFTP 的字节数（实时进度）
 	Error             string          `json:"error"`             // 错误信息
 	SFTPWriteStart    int64           `json:"sftpWriteStart"`    // SFTP 写入开始时间（Unix 毫秒时间戳）
 	SFTPWriteEnd      int64           `json:"sftpWriteEnd"`      // SFTP 写入结束时间（Unix 毫秒时间戳）
@@ -62,8 +64,11 @@ type uploadWriter struct {
 	buffer         *bytes.Buffer
 	ctx            context.Context
 	closed         bool
-	sftpWriteStart time.Time // SFTP 写入开始时间
-	sftpWriteEnd   time.Time // SFTP 写入结束时间
+	sftpWriteStart time.Time                  // SFTP 写入开始时间
+	sftpWriteEnd   time.Time                  // SFTP 写入结束时间
+	sftpWritten    int64                      // 已写入 SFTP 的字节数
+	onProgress     func(written, total int64) // SFTP 写入进度回调
+	mu             sync.Mutex
 }
 
 func (w *uploadWriter) Write(p []byte) (n int, err error) {
@@ -86,14 +91,56 @@ func (w *uploadWriter) Close() error {
 	// 记录 SFTP 写入开始时间
 	w.sftpWriteStart = time.Now()
 
-	// 将缓冲区数据写入 SFTP
+	// 创建带进度跟踪的 reader
 	reader := bytes.NewReader(w.buffer.Bytes())
-	err := w.finder.UploadStream(w.ctx, reader, w.remoteDir, w.remoteFile)
+	totalSize := int64(w.buffer.Len())
+
+	// 创建进度回调函数
+	progressCallback := func(written, total int64) {
+		w.mu.Lock()
+		w.sftpWritten = written
+		w.mu.Unlock()
+
+		// 调用外部进度回调（通过 WebSocket 发送）
+		if w.onProgress != nil {
+			w.onProgress(written, total)
+		}
+
+		// 记录日志以便调试
+		percent := float64(written) / float64(total) * 100
+		slog.Info("SFTP 写入进度",
+			slog.Int64("written", written),
+			slog.Int64("total", total),
+			slog.Float64("percent", percent),
+		)
+	}
+
+	// 直接调用 UploadStreamWithProgress（现在接口中已定义）
+	err := w.finder.UploadStreamWithProgress(w.ctx, reader, w.remoteDir, w.remoteFile, totalSize, progressCallback)
 
 	// 记录 SFTP 写入结束时间
 	w.sftpWriteEnd = time.Now()
 
+	// 更新最终写入字节数
+	w.mu.Lock()
+	w.sftpWritten = totalSize
+	w.mu.Unlock()
+
 	return err
+}
+
+// GetSFTPWritten 获取已写入 SFTP 的字节数
+func (w *uploadWriter) GetSFTPWritten() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sftpWritten
+}
+
+// SetProgressCallback 设置进度回调函数
+func (w *uploadWriter) SetProgressCallback(callback func(written, total int64)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onProgress = callback
 }
 
 // GetSFTPWriteDuration 获取 SFTP 写入耗时（毫秒）
@@ -154,21 +201,36 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 			finderID = r.Header.Get("x-finder-id")
 		}
 		if finderID == "" {
-			sendError(conn, "", "finder id is required")
+			sendErrorSync(conn, "", "finder id is required")
 			return
 		}
 
 		id, err := strconv.ParseInt(finderID, 10, 64)
 		if err != nil {
-			sendError(conn, "", fmt.Sprintf("invalid finder id: %v", err))
+			sendErrorSync(conn, "", fmt.Sprintf("invalid finder id: %v", err))
 			return
 		}
 
 		fd, ok := h.finders[id]
 		if !ok {
-			sendError(conn, "", "finder not found")
+			sendErrorSync(conn, "", "finder not found")
 			return
 		}
+
+		// 创建消息发送队列，用于序列化所有 WebSocket 写入
+		msgChan := make(chan WebSocketUploadMessage, 100)
+		done := make(chan struct{})
+
+		// 启动消息发送 goroutine，序列化所有 WebSocket 写入
+		go func() {
+			defer close(done)
+			for msg := range msgChan {
+				if err := conn.WriteJSON(msg); err != nil {
+					slog.Error("发送 WebSocket 消息失败", slog.Any("err", err))
+					return
+				}
+			}
+		}()
 
 		// 存储活跃的上传会话
 		sessions := make(map[string]*WebSocketUploadSession)
@@ -201,17 +263,17 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 			switch msg.Type {
 			case wsMsgTypeStart:
 				// 开始上传
-				err := handleStartUpload(conn, &msg, fd, sessions)
+				err := handleStartUpload(msgChan, &msg, fd, sessions)
 				if err != nil {
 					slog.Error("处理开始上传失败", slog.Any("err", err))
-					sendError(conn, msg.ID, err.Error())
+					sendError(msgChan, msg.ID, err.Error())
 				}
 			case wsMsgTypeChunk:
 				// 文件数据块
-				err := handleChunk(conn, &msg, sessions)
+				err := handleChunk(msgChan, &msg, sessions)
 				if err != nil {
 					slog.Error("处理数据块失败", slog.Any("err", err))
-					sendError(conn, msg.ID, err.Error())
+					sendError(msgChan, msg.ID, err.Error())
 					// 清理会话
 					if session, ok := sessions[msg.ID]; ok {
 						session.Writer.Close()
@@ -220,10 +282,10 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 				}
 			case wsMsgTypeEnd:
 				// 上传结束
-				err := handleEndUpload(conn, &msg, sessions)
+				err := handleEndUpload(msgChan, &msg, sessions)
 				if err != nil {
 					slog.Error("处理上传结束失败", slog.Any("err", err))
-					sendError(conn, msg.ID, err.Error())
+					sendError(msgChan, msg.ID, err.Error())
 				}
 				// 清理会话
 				if session, ok := sessions[msg.ID]; ok {
@@ -231,7 +293,7 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 					delete(sessions, msg.ID)
 				}
 			default:
-				sendError(conn, msg.ID, fmt.Sprintf("unknown message type: %s", msg.Type))
+				sendError(msgChan, msg.ID, fmt.Sprintf("unknown message type: %s", msg.Type))
 			}
 		}
 
@@ -239,11 +301,15 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 		for _, session := range sessions {
 			session.Writer.Close()
 		}
+
+		// 关闭消息队列，等待发送 goroutine 完成
+		close(msgChan)
+		<-done
 	}
 }
 
 // handleStartUpload 处理开始上传
-func handleStartUpload(conn *websocket.Conn, msg *WebSocketUploadMessage, fd finder.Finder, sessions map[string]*WebSocketUploadSession) error {
+func handleStartUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, fd finder.Finder, sessions map[string]*WebSocketUploadSession) error {
 	// 创建流式写入器
 	writer, err := createUploadWriter(fd, msg.Path, msg.FileName)
 	if err != nil {
@@ -262,6 +328,26 @@ func handleStartUpload(conn *websocket.Conn, msg *WebSocketUploadMessage, fd fin
 
 	sessions[msg.ID] = session
 
+	// 设置进度回调，通过 WebSocket 发送进度更新
+	// 注意：需要在 Close() 之前设置，因为 Close() 会触发 SFTP 写入
+	if uploadWriter, ok := writer.(*uploadWriter); ok {
+		uploadWriter.SetProgressCallback(func(written, total int64) {
+			// 通过消息队列发送 SFTP 写入进度更新（非阻塞）
+			select {
+			case msgChan <- WebSocketUploadMessage{
+				Type:        wsMsgTypeProgress,
+				ID:          msg.ID,
+				Size:        total,
+				Offset:      session.Offset, // 接收进度
+				SFTPWritten: written,        // SFTP 写入进度
+			}:
+			default:
+				// 如果队列满了，记录警告但不阻塞
+				slog.Warn("消息队列已满，跳过进度更新")
+			}
+		})
+	}
+
 	slog.Info("开始上传文件",
 		slog.String("id", msg.ID),
 		slog.String("fileName", msg.FileName),
@@ -270,16 +356,17 @@ func handleStartUpload(conn *websocket.Conn, msg *WebSocketUploadMessage, fd fin
 	)
 
 	// 发送确认消息
-	return sendMessage(conn, WebSocketUploadMessage{
+	msgChan <- WebSocketUploadMessage{
 		Type:   wsMsgTypeProgress,
 		ID:     msg.ID,
 		Size:   msg.Size,
 		Offset: 0,
-	})
+	}
+	return nil
 }
 
 // handleChunk 处理文件数据块
-func handleChunk(conn *websocket.Conn, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
+func handleChunk(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
 	session, ok := sessions[msg.ID]
 	if !ok {
 		return fmt.Errorf("session not found: %s", msg.ID)
@@ -304,8 +391,15 @@ func handleChunk(conn *websocket.Conn, msg *WebSocketUploadMessage, sessions map
 	}
 	session.Offset += int64(n)
 
+	// 获取已写入 SFTP 的字节数（实时进度）
+	var sftpWritten int64
+	if writer, ok := session.Writer.(*uploadWriter); ok {
+		sftpWritten = writer.GetSFTPWritten()
+	}
+
 	// 计算进度百分比
 	percent := float64(session.Offset) / float64(session.Size) * 100
+	sftpPercent := float64(sftpWritten) / float64(session.Size) * 100
 
 	// 每 10% 或每 1MB 或完成时记录一次日志，避免日志过多
 	lastLoggedPercent := int(percent/10) * 10
@@ -321,24 +415,25 @@ func handleChunk(conn *websocket.Conn, msg *WebSocketUploadMessage, sessions map
 			slog.Int64("offset", session.Offset),
 			slog.Int64("size", session.Size),
 			slog.Float64("percent", percent),
+			slog.Int64("sftpWritten", sftpWritten),
+			slog.Float64("sftpPercent", sftpPercent),
 			slog.Int("chunkSize", len(chunkData)),
 		)
 	}
 
-	// 发送进度更新
-	if err := sendMessage(conn, WebSocketUploadMessage{
-		Type:   wsMsgTypeProgress,
-		ID:     msg.ID,
-		Size:   session.Size,
-		Offset: session.Offset,
-	}); err != nil {
-		return fmt.Errorf("发送进度更新失败: %w", err)
+	// 发送进度更新，包含 SFTP 写入进度
+	msgChan <- WebSocketUploadMessage{
+		Type:        wsMsgTypeProgress,
+		ID:          msg.ID,
+		Size:        session.Size,
+		Offset:      session.Offset,
+		SFTPWritten: sftpWritten,
 	}
 	return nil
 }
 
 // handleEndUpload 处理上传结束
-func handleEndUpload(conn *websocket.Conn, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
+func handleEndUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
 	session, ok := sessions[msg.ID]
 	if !ok {
 		return fmt.Errorf("session not found: %s", msg.ID)
@@ -382,24 +477,39 @@ func handleEndUpload(conn *websocket.Conn, msg *WebSocketUploadMessage, sessions
 
 	// 发送成功消息，包含 SFTP 写入时间信息
 	successData, _ := json.Marshal(storage)
-	return sendMessage(conn, WebSocketUploadMessage{
+	msgChan <- WebSocketUploadMessage{
 		Type:              wsMsgTypeSuccess,
 		ID:                msg.ID,
 		Data:              successData,
 		SFTPWriteStart:    sftpWriteStart,
 		SFTPWriteEnd:      sftpWriteEnd,
 		SFTPWriteDuration: sftpWriteDuration,
-	})
+	}
+	return nil
 }
 
-// sendMessage 发送消息
-func sendMessage(conn *websocket.Conn, msg WebSocketUploadMessage) error {
-	return conn.WriteJSON(msg)
+// sendMessage 通过消息队列发送消息
+func sendMessage(msgChan chan<- WebSocketUploadMessage, msg WebSocketUploadMessage) error {
+	select {
+	case msgChan <- msg:
+		return nil
+	default:
+		return fmt.Errorf("消息队列已满")
+	}
 }
 
-// sendError 发送错误消息
-func sendError(conn *websocket.Conn, id, errorMsg string) {
-	sendMessage(conn, WebSocketUploadMessage{
+// sendError 通过消息队列发送错误消息
+func sendError(msgChan chan<- WebSocketUploadMessage, id, errorMsg string) {
+	msgChan <- WebSocketUploadMessage{
+		Type:  wsMsgTypeError,
+		ID:    id,
+		Error: errorMsg,
+	}
+}
+
+// sendErrorSync 同步发送错误消息（用于初始化阶段，消息队列还未创建时）
+func sendErrorSync(conn *websocket.Conn, id, errorMsg string) {
+	conn.WriteJSON(WebSocketUploadMessage{
 		Type:  wsMsgTypeError,
 		ID:    id,
 		Error: errorMsg,

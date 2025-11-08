@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/ecodeclub/ekit/slice"
 	"github.com/pkg/sftp"
@@ -354,6 +355,145 @@ func (sf *sftpFinder) UploadStream(ctx context.Context, src io.Reader, remoteDir
 	}
 
 	return nil
+}
+
+// UploadStreamWithProgress 流式上传文件，支持进度回调
+func (sf *sftpFinder) UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string, totalSize int64, onProgress func(written, total int64)) error {
+	// 解析路径为实际文件系统路径
+	actualRemoteDir := parseVueFinderPath(remoteDir)
+
+	// 如果 remoteFile 包含路径分隔符，需要解析出目录和文件名
+	if strings.Contains(remoteFile, "/") {
+		parts := strings.Split(remoteFile, "/")
+		remoteFile = parts[len(parts)-1]
+		actualRemoteDir = filepath.Join(actualRemoteDir, strings.Join(parts[:len(parts)-1], "/"))
+	}
+
+	// 构建完整的目标文件路径
+	targetPath := filepath.Join(actualRemoteDir, remoteFile)
+	targetPath = normalizePath(targetPath)
+
+	// 确保目标目录存在
+	targetDir := filepath.Dir(targetPath)
+	if _, err := sf.client.Stat(targetDir); os.IsNotExist(err) {
+		if err = sf.client.MkdirAll(targetDir); err != nil {
+			return err
+		}
+	}
+
+	// 创建并打开目标文件
+	dstFile, err := sf.client.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	// 创建进度跟踪写入器
+	// 每 64KB 报告一次进度，提供更细粒度的进度更新
+	progressWriter := &progressWriter{
+		writer:         dstFile,
+		total:          totalSize,
+		onProgress:     onProgress,
+		reportInterval: 64 * 1024, // 64KB 报告间隔，提供更频繁的进度更新
+	}
+
+	// 使用自定义的 Copy 函数，在每次写入后都检查是否需要报告进度
+	// 缓冲区大小为 256KB，但进度报告间隔为 64KB
+	buffer := make([]byte, 256*1024)
+	_, err = copyWithProgress(progressWriter, src, buffer)
+	if err != nil {
+		return err
+	}
+
+	// 确保最后报告 100% 进度
+	if onProgress != nil {
+		onProgress(totalSize, totalSize)
+	}
+
+	return nil
+}
+
+// progressWriter 包装 io.Writer，跟踪写入进度并通过回调发送
+type progressWriter struct {
+	writer         io.Writer
+	total          int64
+	written        int64
+	onProgress     func(written, total int64) // 进度回调函数
+	lastReported   int64                      // 上次报告的字节数
+	reportInterval int64                      // 报告间隔（字节），避免过于频繁的回调
+	mu             sync.Mutex
+}
+
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	pw.mu.Lock()
+	pw.written += int64(n)
+	written := pw.written
+	total := pw.total
+	lastReported := pw.lastReported
+	reportInterval := pw.reportInterval
+	pw.mu.Unlock()
+
+	// 调用进度回调（每 64KB 或完成时报告一次）
+	shouldReport := (written-lastReported) >= reportInterval || written >= total
+	if pw.onProgress != nil && shouldReport {
+		pw.onProgress(written, total)
+		pw.mu.Lock()
+		pw.lastReported = written
+		pw.mu.Unlock()
+	}
+
+	return n, err
+}
+
+// copyWithProgress 自定义的 Copy 函数，确保进度回调被正确触发
+// 使用较小的块大小来读取，以便更频繁地触发进度回调
+func copyWithProgress(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	// 使用较小的读取块（64KB），以便更频繁地触发进度更新
+	readBuf := make([]byte, 64*1024)
+	if len(buf) > 0 {
+		readBuf = buf[:min(len(buf), 64*1024)]
+	}
+
+	for {
+		nr, er := src.Read(readBuf)
+		if nr > 0 {
+			nw, ew := dst.Write(readBuf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = fmt.Errorf("invalid write result")
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // parseVueFinderPath 解析 vuefinder 格式路径 (sftp://path 或 tmp://) 为实际文件系统路径
