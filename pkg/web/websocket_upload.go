@@ -25,10 +25,16 @@ const (
 	wsMsgTypeProgress = "progress" // 进度更新（服务器 -> 客户端）
 	wsMsgTypeSuccess  = "success"  // 上传成功
 	wsMsgTypeError    = "error"    // 上传失败
+
+	// WebSocket 配置常量
+	readDeadline       = 60 * time.Second // 读取超时时间
+	messageQueueSize   = 100              // 消息队列大小
+	logProgressEvery   = 1024 * 1024      // 每 1MB 记录一次进度日志
+	logProgressPercent = 10               // 每 10% 记录一次进度日志
 )
 
-// WebSocketUploadMessage WebSocket 消息结构
-type WebSocketUploadMessage struct {
+// UploadMessage WebSocket 消息结构
+type UploadMessage struct {
 	Type              string          `json:"type"`              // 消息类型
 	ID                string          `json:"id"`                // 上传任务 ID
 	FileName          string          `json:"fileName"`          // 文件名
@@ -43,8 +49,8 @@ type WebSocketUploadMessage struct {
 	SFTPWriteDuration int64           `json:"sftpWriteDuration"` // SFTP 写入耗时（毫秒）
 }
 
-// WebSocketUploadSession 上传会话
-type WebSocketUploadSession struct {
+// UploadSession 上传会话
+type UploadSession struct {
 	ID                string
 	FileName          string
 	Path              string
@@ -52,7 +58,8 @@ type WebSocketUploadSession struct {
 	Writer            io.WriteCloser
 	Finder            finder.Finder
 	Offset            int64
-	lastLoggedPercent int // 上次记录的百分比（用于控制日志频率）
+	lastLoggedPercent int          // 上次记录的百分比（用于控制日志频率）
+	mu                sync.RWMutex // 保护 Offset 的并发访问
 }
 
 // uploadWriter 实现 io.WriteCloser，用于流式写入到 SFTP
@@ -105,14 +112,6 @@ func (w *uploadWriter) Close() error {
 		if w.onProgress != nil {
 			w.onProgress(written, total)
 		}
-
-		// 记录日志以便调试
-		percent := float64(written) / float64(total) * 100
-		slog.Info("SFTP 写入进度",
-			slog.Int64("written", written),
-			slog.Int64("total", total),
-			slog.Float64("percent", percent),
-		)
 	}
 
 	// 直接调用 UploadStreamWithProgress（现在接口中已定义）
@@ -168,12 +167,12 @@ func (w *uploadWriter) GetSFTPWriteEnd() int64 {
 }
 
 // createUploadWriter 创建上传写入器
-func createUploadWriter(fd finder.Finder, remoteDir, remoteFile string) (io.WriteCloser, error) {
+func createUploadWriter(ctx context.Context, fd finder.Finder, remoteDir, remoteFile string) (io.WriteCloser, error) {
 	return &uploadWriter{
 		finder:     fd,
 		remoteDir:  remoteDir,
 		remoteFile: remoteFile,
-		ctx:        context.Background(),
+		ctx:        ctx,
 	}, nil
 }
 
@@ -184,8 +183,8 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// WebSocketUploadHandler 处理 WebSocket 文件上传
-func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
+// UploadHandler 处理 WebSocket 文件上传
+func UploadHandler(h *Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 升级为 WebSocket 连接
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -218,89 +217,96 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 		}
 
 		// 创建消息发送队列，用于序列化所有 WebSocket 写入
-		msgChan := make(chan WebSocketUploadMessage, 100)
+		msgChan := make(chan UploadMessage, messageQueueSize)
 		done := make(chan struct{})
 
 		// 启动消息发送 goroutine，序列化所有 WebSocket 写入
 		go func() {
 			defer close(done)
 			for msg := range msgChan {
-				if err := conn.WriteJSON(msg); err != nil {
+				if err = conn.WriteJSON(msg); err != nil {
 					slog.Error("发送 WebSocket 消息失败", slog.Any("err", err))
 					return
 				}
 			}
 		}()
 
-		// 存储活跃的上传会话
-		sessions := make(map[string]*WebSocketUploadSession)
+		// 存储活跃的上传会话（使用带锁的 map）
+		sessions := make(map[string]*UploadSession)
+		sessionsMu := sync.RWMutex{}
 
 		// 设置读取超时和关闭处理
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+			slog.Warn("设置读取超时失败", slog.Any("err", err))
+		}
 		conn.SetPongHandler(func(string) error {
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+				slog.Warn("重置读取超时失败", slog.Any("err", err))
+			}
 			return nil
 		})
 
+		// 使用请求上下文，支持取消操作
+		ctx := r.Context()
+
 		// 读取消息循环
 		for {
-			var msg WebSocketUploadMessage
+			var msg UploadMessage
 			err := conn.ReadJSON(&msg)
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				// 检查是否是正常的关闭错误
+				if isNormalClose(err) {
+					slog.Debug("WebSocket 正常关闭", slog.Any("err", err))
+				} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					slog.Error("WebSocket 读取错误", slog.Any("err", err))
-				} else if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-					slog.Info("WebSocket 正常关闭")
 				} else {
-					slog.Error("WebSocket 读取消息失败", slog.Any("err", err))
+					slog.Debug("WebSocket 连接关闭", slog.Any("err", err))
 				}
 				break
 			}
 
 			// 重置读取超时
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+				slog.Warn("重置读取超时失败", slog.Any("err", err))
+			}
 
 			switch msg.Type {
 			case wsMsgTypeStart:
 				// 开始上传
-				err := handleStartUpload(msgChan, &msg, fd, sessions)
+				err := handleStartUpload(ctx, msgChan, &msg, fd, sessions, &sessionsMu)
 				if err != nil {
 					slog.Error("处理开始上传失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 				}
 			case wsMsgTypeChunk:
 				// 文件数据块
-				err := handleChunk(msgChan, &msg, sessions)
+				err := handleChunk(msgChan, &msg, sessions, &sessionsMu)
 				if err != nil {
 					slog.Error("处理数据块失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 					// 清理会话
-					if session, ok := sessions[msg.ID]; ok {
-						session.Writer.Close()
-						delete(sessions, msg.ID)
-					}
+					cleanupSession(sessions, &sessionsMu, msg.ID)
 				}
 			case wsMsgTypeEnd:
 				// 上传结束
-				err := handleEndUpload(msgChan, &msg, sessions)
+				err := handleEndUpload(ctx, msgChan, &msg, sessions, &sessionsMu)
 				if err != nil {
 					slog.Error("处理上传结束失败", slog.Any("err", err))
 					sendError(msgChan, msg.ID, err.Error())
 				}
 				// 清理会话
-				if session, ok := sessions[msg.ID]; ok {
-					session.Writer.Close()
-					delete(sessions, msg.ID)
-				}
+				cleanupSession(sessions, &sessionsMu, msg.ID)
 			default:
 				sendError(msgChan, msg.ID, fmt.Sprintf("unknown message type: %s", msg.Type))
 			}
 		}
 
 		// 清理所有会话
+		sessionsMu.Lock()
 		for _, session := range sessions {
 			session.Writer.Close()
 		}
+		sessionsMu.Unlock()
 
 		// 关闭消息队列，等待发送 goroutine 完成
 		close(msgChan)
@@ -308,15 +314,25 @@ func WebSocketUploadHandler(h *Handler) http.HandlerFunc {
 	}
 }
 
+// cleanupSession 清理会话
+func cleanupSession(sessions map[string]*UploadSession, mu *sync.RWMutex, id string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if session, ok := sessions[id]; ok {
+		session.Writer.Close()
+		delete(sessions, id)
+	}
+}
+
 // handleStartUpload 处理开始上传
-func handleStartUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, fd finder.Finder, sessions map[string]*WebSocketUploadSession) error {
+func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd finder.Finder, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
 	// 创建流式写入器
-	writer, err := createUploadWriter(fd, msg.Path, msg.FileName)
+	writer, err := createUploadWriter(ctx, fd, msg.Path, msg.FileName)
 	if err != nil {
 		return fmt.Errorf("创建上传流失败: %w", err)
 	}
 
-	session := &WebSocketUploadSession{
+	session := &UploadSession{
 		ID:       msg.ID,
 		FileName: msg.FileName,
 		Path:     msg.Path,
@@ -326,37 +342,37 @@ func handleStartUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUplo
 		Offset:   0,
 	}
 
+	mu.Lock()
 	sessions[msg.ID] = session
+	mu.Unlock()
 
 	// 设置进度回调，通过 WebSocket 发送进度更新
 	// 注意：需要在 Close() 之前设置，因为 Close() 会触发 SFTP 写入
 	if uploadWriter, ok := writer.(*uploadWriter); ok {
 		uploadWriter.SetProgressCallback(func(written, total int64) {
+			// 读取当前接收进度（需要加锁）
+			session.mu.RLock()
+			offset := session.Offset
+			session.mu.RUnlock()
+
 			// 通过消息队列发送 SFTP 写入进度更新（非阻塞）
 			select {
-			case msgChan <- WebSocketUploadMessage{
+			case msgChan <- UploadMessage{
 				Type:        wsMsgTypeProgress,
 				ID:          msg.ID,
 				Size:        total,
-				Offset:      session.Offset, // 接收进度
-				SFTPWritten: written,        // SFTP 写入进度
+				Offset:      offset,  // 接收进度
+				SFTPWritten: written, // SFTP 写入进度
 			}:
 			default:
 				// 如果队列满了，记录警告但不阻塞
-				slog.Warn("消息队列已满，跳过进度更新")
+				slog.Warn("消息队列已满，跳过进度更新", slog.String("id", msg.ID))
 			}
 		})
 	}
 
-	slog.Info("开始上传文件",
-		slog.String("id", msg.ID),
-		slog.String("fileName", msg.FileName),
-		slog.String("path", msg.Path),
-		slog.Int64("size", msg.Size),
-	)
-
 	// 发送确认消息
-	msgChan <- WebSocketUploadMessage{
+	msgChan <- UploadMessage{
 		Type:   wsMsgTypeProgress,
 		ID:     msg.ID,
 		Size:   msg.Size,
@@ -366,8 +382,10 @@ func handleStartUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUplo
 }
 
 // handleChunk 处理文件数据块
-func handleChunk(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
+func handleChunk(msgChan chan<- UploadMessage, msg *UploadMessage, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
+	mu.RLock()
 	session, ok := sessions[msg.ID]
+	mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("session not found: %s", msg.ID)
 	}
@@ -389,7 +407,13 @@ func handleChunk(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMess
 	if err != nil {
 		return fmt.Errorf("写入数据失败: %w", err)
 	}
+
+	// 更新接收进度（需要加锁）
+	session.mu.Lock()
 	session.Offset += int64(n)
+	offset := session.Offset
+	lastLoggedPercent := session.lastLoggedPercent
+	session.mu.Unlock()
 
 	// 获取已写入 SFTP 的字节数（实时进度）
 	var sftpWritten int64
@@ -397,53 +421,39 @@ func handleChunk(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMess
 		sftpWritten = writer.GetSFTPWritten()
 	}
 
-	// 计算进度百分比
-	percent := float64(session.Offset) / float64(session.Size) * 100
-	sftpPercent := float64(sftpWritten) / float64(session.Size) * 100
+	// 更新上次记录的百分比（用于控制日志频率，但不再记录日志）
+	percent := float64(offset) / float64(session.Size) * 100
+	currentLoggedPercent := int(percent/float64(logProgressPercent)) * logProgressPercent
 
-	// 每 10% 或每 1MB 或完成时记录一次日志，避免日志过多
-	lastLoggedPercent := int(percent/10) * 10
-	shouldLog := session.Offset%(1024*1024) == 0 || // 每 1MB
-		(session.Offset == session.Size) || // 完成时
-		(lastLoggedPercent != session.lastLoggedPercent) // 每 10% 变化时
-
-	if shouldLog {
-		session.lastLoggedPercent = lastLoggedPercent
-		slog.Info("上传进度",
-			slog.String("id", msg.ID),
-			slog.String("fileName", session.FileName),
-			slog.Int64("offset", session.Offset),
-			slog.Int64("size", session.Size),
-			slog.Float64("percent", percent),
-			slog.Int64("sftpWritten", sftpWritten),
-			slog.Float64("sftpPercent", sftpPercent),
-			slog.Int("chunkSize", len(chunkData)),
-		)
+	if currentLoggedPercent != lastLoggedPercent {
+		session.mu.Lock()
+		session.lastLoggedPercent = currentLoggedPercent
+		session.mu.Unlock()
 	}
 
 	// 发送进度更新，包含 SFTP 写入进度
-	msgChan <- WebSocketUploadMessage{
+	msgChan <- UploadMessage{
 		Type:        wsMsgTypeProgress,
 		ID:          msg.ID,
 		Size:        session.Size,
-		Offset:      session.Offset,
+		Offset:      offset,
 		SFTPWritten: sftpWritten,
 	}
 	return nil
 }
 
 // handleEndUpload 处理上传结束
-func handleEndUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUploadMessage, sessions map[string]*WebSocketUploadSession) error {
+func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
+	mu.RLock()
 	session, ok := sessions[msg.ID]
+	mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("session not found: %s", msg.ID)
 	}
 
-	slog.Info("上传完成，正在关闭写入器",
-		slog.String("id", msg.ID),
-		slog.String("fileName", session.FileName),
-		slog.Int64("totalSize", session.Offset),
-	)
+	session.mu.RLock()
+	totalSize := session.Offset
+	session.mu.RUnlock()
 
 	// 在关闭之前保存 uploadWriter 引用，以便获取 SFTP 写入时间信息
 	var sftpWriteStart, sftpWriteEnd, sftpWriteDuration int64
@@ -465,19 +475,22 @@ func handleEndUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUpload
 		slog.String("id", msg.ID),
 		slog.String("fileName", session.FileName),
 		slog.String("path", session.Path),
-		slog.Int64("size", session.Offset),
+		slog.Int64("size", totalSize),
 		slog.Int64("sftpWriteDuration", sftpWriteDuration),
 	)
 
-	// 获取文件列表
-	storage, err := session.Finder.Index(context.Background(), session.Path)
+	// 获取文件列表（使用请求上下文）
+	storage, err := session.Finder.Index(ctx, session.Path)
 	if err != nil {
 		return fmt.Errorf("获取文件列表失败: %w", err)
 	}
 
 	// 发送成功消息，包含 SFTP 写入时间信息
-	successData, _ := json.Marshal(storage)
-	msgChan <- WebSocketUploadMessage{
+	successData, err := json.Marshal(storage)
+	if err != nil {
+		return fmt.Errorf("序列化文件列表失败: %w", err)
+	}
+	msgChan <- UploadMessage{
 		Type:              wsMsgTypeSuccess,
 		ID:                msg.ID,
 		Data:              successData,
@@ -489,7 +502,7 @@ func handleEndUpload(msgChan chan<- WebSocketUploadMessage, msg *WebSocketUpload
 }
 
 // sendMessage 通过消息队列发送消息
-func sendMessage(msgChan chan<- WebSocketUploadMessage, msg WebSocketUploadMessage) error {
+func sendMessage(msgChan chan<- UploadMessage, msg UploadMessage) error {
 	select {
 	case msgChan <- msg:
 		return nil
@@ -499,19 +512,53 @@ func sendMessage(msgChan chan<- WebSocketUploadMessage, msg WebSocketUploadMessa
 }
 
 // sendError 通过消息队列发送错误消息
-func sendError(msgChan chan<- WebSocketUploadMessage, id, errorMsg string) {
-	msgChan <- WebSocketUploadMessage{
+func sendError(msgChan chan<- UploadMessage, id, errorMsg string) {
+	select {
+	case msgChan <- UploadMessage{
 		Type:  wsMsgTypeError,
 		ID:    id,
 		Error: errorMsg,
+	}:
+	default:
+		// 如果队列满了，记录警告
+		slog.Warn("消息队列已满，无法发送错误消息", slog.String("id", id), slog.String("error", errorMsg))
 	}
 }
 
 // sendErrorSync 同步发送错误消息（用于初始化阶段，消息队列还未创建时）
 func sendErrorSync(conn *websocket.Conn, id, errorMsg string) {
-	conn.WriteJSON(WebSocketUploadMessage{
+	if err := conn.WriteJSON(UploadMessage{
 		Type:  wsMsgTypeError,
 		ID:    id,
 		Error: errorMsg,
-	})
+	}); err != nil {
+		slog.Error("同步发送错误消息失败", slog.Any("err", err), slog.String("id", id))
+	}
+}
+
+// isNormalClose 检查是否是正常的关闭错误
+// 1005 (no status) 通常表示正常关闭，不应该记录为错误
+func isNormalClose(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 检查是否是正常的关闭错误
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		return true
+	}
+
+	// 检查是否是 1005 (no status) 错误
+	// 这通常发生在客户端正常关闭连接时
+	errStr := err.Error()
+	if errStr == "websocket: close 1005 (no status)" {
+		return true
+	}
+
+	// 检查是否包含 "1005" 或 "no status"
+	if websocket.IsCloseError(err, 1005) {
+		return true
+	}
+
+	return false
 }

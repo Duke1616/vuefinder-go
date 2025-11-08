@@ -34,7 +34,7 @@ func (h *Handler) RegisterUploadRoute(server *gin.Engine) {
 
 	// WebSocket 上传（支持实时进度和双向通信）
 	server.GET("/api/finder/upload/ws", func(ctx *gin.Context) {
-		WebSocketUploadHandler(h)(ctx.Writer, ctx.Request)
+		UploadHandler(h)(ctx.Writer, ctx.Request)
 	})
 }
 

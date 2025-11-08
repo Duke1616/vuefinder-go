@@ -18,11 +18,8 @@ export class WebSocketUploader {
       const wsURL = this.baseURL.replace(/^http/, 'ws') + '/upload/ws?id=' + this.finderId;
       const ws = new WebSocket(wsURL);
       const uploadId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      let uploadedBytes = 0;
 
       ws.onopen = () => {
-        console.log(`[WebSocket上传] 连接已建立，开始上传文件: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
-        
         // 发送开始消息
         ws.send(JSON.stringify({
           type: 'start',
@@ -32,12 +29,8 @@ export class WebSocketUploader {
           size: file.size,
         }));
 
-        console.log(`[WebSocket上传] 已发送开始消息: id=${uploadId}, path=${path}`);
-
         // 开始读取文件并发送
         this.readAndSendFile(ws, file, uploadId, (bytes) => {
-          uploadedBytes = bytes;
-          const percent = ((bytes / file.size) * 100).toFixed(2);
           if (onProgress) {
             onProgress({
               bytesUploaded: bytes,
@@ -52,19 +45,9 @@ export class WebSocketUploader {
           const msg = JSON.parse(event.data);
           
           if (msg.type === 'progress') {
-            const percent = ((msg.offset / msg.size) * 100).toFixed(2);
-            const uploadedMB = (msg.offset / 1024 / 1024).toFixed(2);
-            const totalMB = (msg.size / 1024 / 1024).toFixed(2);
-            
             // SFTP 写入进度
             const sftpWritten = msg.sftpWritten || 0;
             const sftpPercent = sftpWritten > 0 ? ((sftpWritten / msg.size) * 100).toFixed(2) : '0.00';
-            const sftpMB = (sftpWritten / 1024 / 1024).toFixed(2);
-            
-            console.log(`[WebSocket上传] 接收进度: ${percent}% (${uploadedMB} MB / ${totalMB} MB)`);
-            if (sftpWritten > 0) {
-              console.log(`[WebSocket上传] SFTP写入进度: ${sftpPercent}% (${sftpMB} MB / ${totalMB} MB)`);
-            }
             
             if (onProgress) {
               onProgress({
@@ -75,21 +58,6 @@ export class WebSocketUploader {
               });
             }
           } else if (msg.type === 'success') {
-            // 显示 SFTP 写入时间信息
-            if (msg.sftpWriteDuration) {
-              const duration = (msg.sftpWriteDuration / 1000).toFixed(2);
-              const speed = file.size / msg.sftpWriteDuration * 1000 / 1024 / 1024; // MB/s
-              console.log(`[WebSocket上传] 上传成功: ${file.name}`);
-              console.log(`[WebSocket上传] SFTP 写入耗时: ${duration} 秒 (${msg.sftpWriteDuration} 毫秒)`);
-              console.log(`[WebSocket上传] SFTP 写入速度: ${speed.toFixed(2)} MB/s`);
-              if (msg.sftpWriteStart && msg.sftpWriteEnd) {
-                const startTime = new Date(msg.sftpWriteStart).toLocaleTimeString();
-                const endTime = new Date(msg.sftpWriteEnd).toLocaleTimeString();
-                console.log(`[WebSocket上传] SFTP 写入时间: ${startTime} - ${endTime}`);
-              }
-            } else {
-              console.log(`[WebSocket上传] 上传成功: ${file.name}`);
-            }
             ws.close();
             if (onSuccess) {
               onSuccess(msg.data);
@@ -119,10 +87,11 @@ export class WebSocketUploader {
       };
 
       ws.onclose = (event) => {
-        if (event.code === 1000) {
-          console.log(`[WebSocket上传] 连接正常关闭`);
-        } else {
-          console.warn(`[WebSocket上传] 连接关闭: code=${event.code}, reason=${event.reason || '无原因'}`);
+        // 1000: 正常关闭
+        // 1005: 没有状态码（通常表示正常关闭，浏览器没有提供状态码，常见于上传完成后）
+        // 只记录异常关闭的情况
+        if (event.code !== 1000 && event.code !== 1005) {
+          console.warn(`[WebSocket上传] 连接异常关闭: code=${event.code}, reason=${event.reason || '无原因'}`);
         }
       };
     });
@@ -132,11 +101,9 @@ export class WebSocketUploader {
     const reader = new FileReader();
     let offset = 0;
 
-    let chunkCount = 0;
     const readNextChunk = () => {
       if (offset >= file.size) {
         // 文件读取完成，发送结束消息
-        console.log(`[WebSocket上传] 文件读取完成，共发送 ${chunkCount} 个数据块，总大小: ${(offset / 1024 / 1024).toFixed(2)} MB`);
         ws.send(JSON.stringify({
           type: 'end',
           id: uploadId,
@@ -145,7 +112,6 @@ export class WebSocketUploader {
       }
 
       const chunk = file.slice(offset, offset + this.chunkSize);
-      chunkCount++;
       
       reader.onload = (e) => {
         const arrayBuffer = e.target.result;
@@ -166,12 +132,6 @@ export class WebSocketUploader {
         }));
 
         offset += arrayBuffer.byteLength;
-        
-        // 每 10 个块或每 1MB 记录一次日志
-        if (chunkCount % 10 === 0 || offset % (1024 * 1024) < this.chunkSize) {
-          const percent = ((offset / file.size) * 100).toFixed(2);
-          console.log(`[WebSocket上传] 已发送 ${chunkCount} 个数据块，进度: ${percent}% (${(offset / 1024 / 1024).toFixed(2)} MB)`);
-        }
         
         // 更新进度
         if (onProgress) {
