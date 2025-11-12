@@ -29,6 +29,8 @@ type UploadSession interface {
 	Abort() error
 	// Close 关闭底层资源
 	Close() error
+	// FinalPath 返回最终文件的完整路径（在 Commit 后生效）
+	FinalPath() string
 }
 
 type Finder interface {
@@ -38,16 +40,6 @@ type Finder interface {
 	UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string,
 		totalSize int64, onProgress func(written, total int64)) error
 	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
-	// Open 打开一个可随机读取的文件视图，用于流式下载/断点续传。
-	// 返回值：
-	//  - ra: 实现了 io.ReaderAt 的读取器
-	//  - size: 文件大小（字节）
-	//  - modTime: 文件的修改时间
-	//  - name: 建议的文件名
-	//  - closer: 调用方在读取结束后必须关闭
-	Open(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error)
-	// OpenUpload 打开（或创建）远端临时文件用于断点续传直写
-	OpenUpload(ctx context.Context, remoteDir, remoteFile string) (UploadSession, error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
 	NewFile(ctx context.Context, file, name string) error
@@ -60,6 +52,24 @@ type Finder interface {
 	Delete(ctx context.Context, items []Item, path string) error
 	Search(ctx context.Context, adapter, path, filter string) (Storages, error)
 	Save(ctx context.Context, path, content string) error
+}
+
+// ResumableUploader 提供断点续传直写能力（可与 Finder 解耦）
+type ResumableUploader interface {
+	// OpenUpload 打开（或创建）远端临时文件用于断点续传直写
+	OpenUpload(ctx context.Context, remoteDir, remoteFile string) (UploadSession, error)
+}
+
+// Readable 提供随机读能力（用于下载/Range）
+type Readable interface {
+	// OpenRead 打开一个可随机读取的文件视图，用于流式下载/断点续传。
+	// 返回值：
+	//  - ra: 实现了 io.ReaderAt 的读取器
+	//  - size: 文件大小（字节）
+	//  - modTime: 文件的修改时间
+	//  - name: 建议的文件名
+	//  - closer: 调用方在读取结束后必须关闭
+	OpenRead(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error)
 }
 
 type Storages struct {

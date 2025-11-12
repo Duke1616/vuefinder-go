@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"strconv"
 	"sync"
 	"time"
@@ -44,6 +45,7 @@ type UploadMessage struct {
 	SFTPWriteStart    int64           `json:"sftpWriteStart"`    // SFTP 写入开始时间（Unix 毫秒时间戳）
 	SFTPWriteEnd      int64           `json:"sftpWriteEnd"`      // SFTP 写入结束时间（Unix 毫秒时间戳）
 	SFTPWriteDuration int64           `json:"sftpWriteDuration"` // SFTP 写入耗时（毫秒）
+	FinalName         string          `json:"finalName"`
 }
 
 // UploadSession 上传会话
@@ -364,8 +366,11 @@ func cleanupSession(sessions map[string]*UploadSession, mu *sync.RWMutex, id str
 
 // handleStartUpload 处理开始上传
 func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd finder.Finder, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
-	// 打开/创建远端 .part 文件，会话支持断点续传
-	sess, err := fd.OpenUpload(ctx, msg.Path, msg.FileName)
+	ru, ok := fd.(finder.ResumableUploader)
+	if !ok {
+		return fmt.Errorf("finder does not support resumable upload")
+	}
+	sess, err := ru.OpenUpload(ctx, msg.Path, msg.FileName)
 	if err != nil {
 		return fmt.Errorf("创建上传会话失败: %w", err)
 	}
@@ -381,8 +386,7 @@ func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *U
 	if remoteSize >= msg.Size && msg.Size > 0 {
 		_ = sess.Abort()
 		_ = sess.Close()
-		// 重新创建 .part，从 0 开始
-		sess, err = fd.OpenUpload(ctx, msg.Path, msg.FileName)
+		sess, err = ru.OpenUpload(ctx, msg.Path, msg.FileName)
 		if err != nil {
 			return fmt.Errorf("重置上传会话失败: %w", err)
 		}
@@ -497,6 +501,10 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		return fmt.Errorf("获取文件列表失败: %w", err)
 	}
 
+	finalName := ""
+	if session.Sess != nil {
+		finalName = path.Base(session.Sess.FinalPath())
+	}
 	// 发送成功消息
 	successData, err := json.Marshal(storage)
 	if err != nil {
@@ -506,6 +514,7 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		Type:              wsMsgTypeSuccess,
 		ID:                msg.ID,
 		Data:              successData,
+		FinalName:         finalName,
 	}
 	return nil
 }

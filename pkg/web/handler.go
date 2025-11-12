@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
@@ -29,12 +30,25 @@ func (h *Handler) DownloadStream(ctx *gin.Context) {
 		return
 	}
 
-	ra, size, modTime, name, closer, err := fd.Open(ctx, file)
+	rd, ok := fd.(finder.Readable)
+	if !ok {
+		ctx.String(http.StatusInternalServerError, "finder does not support download")
+		return
+	}
+	ra, size, modTime, name, closer, err := rd.OpenRead(ctx, file)
 	if err != nil {
 		ctx.String(http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer closer.Close()
+	// 包装一个可自动重开的 ReaderAt，提升大文件下载的稳定性
+	wrapped := newRetryReaderAt(ra, closer, 3, func() (io.ReaderAt, io.Closer, error) {
+		nra, _, _, _, ncloser, e := rd.OpenRead(ctx, file)
+		if e != nil {
+			return nil, nil, e
+		}
+		return nra, ncloser, nil
+	})
+	defer wrapped.Close()
 
 	// 解析路径获取文件名作为回退
 	actualPath := file
@@ -58,7 +72,7 @@ func (h *Handler) DownloadStream(ctx *gin.Context) {
 	ctx.Header("Accept-Ranges", "bytes")
 
 	// 使用 SectionReader 将 ReaderAt 适配为 ReadSeeker，交给 ServeContent 自动处理 Range/缓存
-	rs := io.NewSectionReader(ra, 0, size)
+	rs := io.NewSectionReader(wrapped, 0, size)
 	http.ServeContent(ctx.Writer, ctx.Request, name, modTime, rs)
 }
 
@@ -505,4 +519,51 @@ func toFinderItems(req []Item) []finder.Item {
 			Type: src.Type,
 		}
 	})
+}
+
+// retryReaderAt 包装底层 ReaderAt，读失败时尝试重新打开并重试，增强大文件下载的稳健性
+type retryReaderAt struct {
+	mu       sync.Mutex
+	ra       io.ReaderAt
+	closer   io.Closer
+	reopen   func() (io.ReaderAt, io.Closer, error)
+	maxRetry int
+}
+
+func newRetryReaderAt(ra io.ReaderAt, closer io.Closer, maxRetry int, reopen func() (io.ReaderAt, io.Closer, error)) *retryReaderAt {
+	return &retryReaderAt{ra: ra, closer: closer, reopen: reopen, maxRetry: maxRetry}
+}
+
+func (r *retryReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	n, err := r.ra.ReadAt(p, off)
+	if err == nil || r.maxRetry <= 0 {
+		return n, err
+	}
+	// 尝试重开并重试一次
+	if r.closer != nil {
+		_ = r.closer.Close()
+	}
+	nra, ncloser, e := r.reopen()
+	if e != nil {
+		// 返回原始错误，避免吞掉底层错误信息
+		return n, err
+	}
+	r.ra = nra
+	r.closer = ncloser
+	r.maxRetry--
+	return r.ra.ReadAt(p, off)
+}
+
+func (r *retryReaderAt) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closer != nil {
+		err := r.closer.Close()
+		r.closer = nil
+		return err
+	}
+	return nil
 }
