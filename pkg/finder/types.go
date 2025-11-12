@@ -17,6 +17,20 @@ const (
 	BrokenLINK FileType = "broken-link"
 )
 
+// UploadSession 表示一个可在远端随机写入并可提交/回滚的上传会话
+type UploadSession interface {
+	// WriteAt 在指定偏移写入数据
+	WriteAt(p []byte, off int64) (int, error)
+	// Size 返回当前远端文件大小
+	Size() (int64, error)
+	// Commit 提交上传（例如将 .part 重命名为目标文件）
+	Commit() error
+	// Abort 取消上传并清理临时文件
+	Abort() error
+	// Close 关闭底层资源
+	Close() error
+}
+
 type Finder interface {
 	Index(ctx context.Context, path string) (Storages, error)
 	Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error
@@ -32,6 +46,8 @@ type Finder interface {
 	//  - name: 建议的文件名
 	//  - closer: 调用方在读取结束后必须关闭
 	Open(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error)
+	// OpenUpload 打开（或创建）远端临时文件用于断点续传直写
+	OpenUpload(ctx context.Context, remoteDir, remoteFile string) (UploadSession, error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
 	NewFile(ctx context.Context, file, name string) error

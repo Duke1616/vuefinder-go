@@ -52,7 +52,7 @@ type UploadSession struct {
 	FileName string
 	Path     string
 	Size     int64
-	Writer   io.WriteCloser
+	Sess     finder.UploadSession
 	Finder   finder.Finder
 	Offset   int64
 	mu       sync.RWMutex // 保护 Offset 的并发访问
@@ -269,6 +269,21 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 		// 使用请求上下文，支持取消操作
 		ctx := r.Context()
 
+		// 启动 Ping 心跳，避免空闲时被中间设备回收
+		donePing := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(20 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-donePing:
+					return
+				case <-ticker.C:
+					_ = conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+				}
+			}
+		}()
+
 		// 读取消息循环
 		for {
 			var msg UploadMessage
@@ -321,10 +336,14 @@ func UploadHandler(h *Handler) http.HandlerFunc {
 		// 清理所有会话
 		sessionsMu.Lock()
 		for _, session := range sessions {
-			session.Writer.Close()
+			if session.Sess != nil {
+				session.Sess.Close()
+			}
 		}
 		sessionsMu.Unlock()
 
+		// 关闭心跳
+		close(donePing)
 		// 关闭消息队列，等待发送 goroutine 完成
 		close(msgChan)
 		<-done
@@ -336,17 +355,38 @@ func cleanupSession(sessions map[string]*UploadSession, mu *sync.RWMutex, id str
 	mu.Lock()
 	defer mu.Unlock()
 	if session, ok := sessions[id]; ok {
-		session.Writer.Close()
+		if session.Sess != nil {
+			session.Sess.Close()
+		}
 		delete(sessions, id)
 	}
 }
 
 // handleStartUpload 处理开始上传
 func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd finder.Finder, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
-	// 创建流式写入器（传入总大小用于进度计算）
-	writer, err := createUploadWriter(ctx, fd, msg.Path, msg.FileName, msg.Size)
+	// 打开/创建远端 .part 文件，会话支持断点续传
+	sess, err := fd.OpenUpload(ctx, msg.Path, msg.FileName)
 	if err != nil {
-		return fmt.Errorf("创建上传流失败: %w", err)
+		return fmt.Errorf("创建上传会话失败: %w", err)
+	}
+
+	// 查询远端已存在大小，作为续传偏移
+	remoteSize, err := sess.Size()
+	if err != nil {
+		_ = sess.Close()
+		return fmt.Errorf("获取远端大小失败: %w", err)
+	}
+
+	// 如果现存 .part 大小异常（>= 目标大小），视为陈旧文件，重新开始
+	if remoteSize >= msg.Size && msg.Size > 0 {
+		_ = sess.Abort()
+		_ = sess.Close()
+		// 重新创建 .part，从 0 开始
+		sess, err = fd.OpenUpload(ctx, msg.Path, msg.FileName)
+		if err != nil {
+			return fmt.Errorf("重置上传会话失败: %w", err)
+		}
+		remoteSize = 0
 	}
 
 	session := &UploadSession{
@@ -354,46 +394,22 @@ func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *U
 		FileName: msg.FileName,
 		Path:     msg.Path,
 		Size:     msg.Size,
-		Writer:   writer,
+		Sess:     sess,
 		Finder:   fd,
-		Offset:   0,
+		Offset:   remoteSize,
 	}
 
 	mu.Lock()
 	sessions[msg.ID] = session
 	mu.Unlock()
 
-	// 设置进度回调，通过 WebSocket 发送进度更新
-	// 注意：需要在 Close() 之前设置，因为 Close() 会触发 SFTP 写入
-	if uploader, ok := writer.(*uploadWriter); ok {
-		uploader.SetProgressCallback(func(written, total int64) {
-			// 读取当前接收进度（需要加锁）
-			session.mu.RLock()
-			offset := session.Offset
-			session.mu.RUnlock()
-
-			// 通过消息队列发送 SFTP 写入进度更新（非阻塞）
-			select {
-			case msgChan <- UploadMessage{
-				Type:        wsMsgTypeProgress,
-				ID:          msg.ID,
-				Size:        total,
-				Offset:      offset,  // 接收进度
-				SFTPWritten: written, // SFTP 写入进度
-			}:
-			default:
-				// 如果队列满了，记录警告但不阻塞
-				slog.Warn("消息队列已满，跳过进度更新", slog.String("id", msg.ID))
-			}
-		})
-	}
-
-	// 发送确认消息
+	// 初始进度：通知客户端从 remoteSize 续传
 	msgChan <- UploadMessage{
-		Type:   wsMsgTypeProgress,
-		ID:     msg.ID,
-		Size:   msg.Size,
-		Offset: 0,
+		Type:        wsMsgTypeProgress,
+		ID:          msg.ID,
+		Size:        msg.Size,
+		Offset:      remoteSize,
+		SFTPWritten: remoteSize,
 	}
 	return nil
 }
@@ -418,31 +434,33 @@ func handleChunk(msgChan chan<- UploadMessage, msg *UploadMessage, sessions map[
 		return fmt.Errorf("解码 base64 失败: %w", err)
 	}
 
-	// 写入数据
-	n, err := session.Writer.Write(chunkData)
-	if err != nil {
-		return fmt.Errorf("写入数据失败: %w", err)
+	// 选择写入偏移：优先使用消息中的 Offset，否则用会话当前 Offset
+	writeOffset := msg.Offset
+	if writeOffset <= 0 {
+		session.mu.RLock()
+		writeOffset = session.Offset
+		session.mu.RUnlock()
 	}
 
-	// 更新接收进度（需要加锁）
+	// 写入到远端 .part 的指定偏移
+	n, err := session.Sess.WriteAt(chunkData, writeOffset)
+	if err != nil {
+		return fmt.Errorf("写入远端失败: %w", err)
+	}
+
+	// 更新会话偏移
 	session.mu.Lock()
-	session.Offset += int64(n)
-	offset := session.Offset
+	newOffset := writeOffset + int64(n)
+	session.Offset = newOffset
 	session.mu.Unlock()
 
-	// 获取已写入 SFTP 的字节数（实时进度）
-	var sftpWritten int64
-	if writer, ok := session.Writer.(*uploadWriter); ok {
-		sftpWritten = writer.GetSFTPWritten()
-	}
-
-	// 发送进度更新，包含 SFTP 写入进度
+	// 发送进度更新（Offset = 已接收/已写入，SFTPWritten 同步）
 	msgChan <- UploadMessage{
 		Type:        wsMsgTypeProgress,
 		ID:          msg.ID,
 		Size:        session.Size,
-		Offset:      offset,
-		SFTPWritten: sftpWritten,
+		Offset:      newOffset,
+		SFTPWritten: newOffset,
 	}
 	return nil
 }
@@ -456,32 +474,21 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		return fmt.Errorf("session not found: %s", msg.ID)
 	}
 
+	// 提交远端 .part -> 最终文件
+	if err := session.Sess.Commit(); err != nil {
+		return fmt.Errorf("提交上传失败: %w", err)
+	}
+	_ = session.Sess.Close()
+
 	session.mu.RLock()
 	totalSize := session.Offset
 	session.mu.RUnlock()
-
-	// 在关闭之前保存 uploadWriter 引用，以便获取 SFTP 写入时间信息
-	var sftpWriteStart, sftpWriteEnd, sftpWriteDuration int64
-	writer, isUploadWriter := session.Writer.(*uploadWriter)
-
-	// 关闭写入器（这会触发 SFTP 写入）
-	if err := session.Writer.Close(); err != nil {
-		return fmt.Errorf("关闭写入器失败: %w", err)
-	}
-
-	// 获取 SFTP 写入时间信息
-	if isUploadWriter && writer != nil {
-		sftpWriteStart = writer.GetSFTPWriteStart()
-		sftpWriteEnd = writer.GetSFTPWriteEnd()
-		sftpWriteDuration = writer.GetSFTPWriteDuration()
-	}
 
 	slog.Info("文件上传成功",
 		slog.String("id", msg.ID),
 		slog.String("fileName", session.FileName),
 		slog.String("path", session.Path),
 		slog.Int64("size", totalSize),
-		slog.Int64("sftpWriteDuration", sftpWriteDuration),
 	)
 
 	// 获取文件列表（使用请求上下文）
@@ -490,7 +497,7 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		return fmt.Errorf("获取文件列表失败: %w", err)
 	}
 
-	// 发送成功消息，包含 SFTP 写入时间信息
+	// 发送成功消息
 	successData, err := json.Marshal(storage)
 	if err != nil {
 		return fmt.Errorf("序列化文件列表失败: %w", err)
@@ -499,9 +506,6 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		Type:              wsMsgTypeSuccess,
 		ID:                msg.ID,
 		Data:              successData,
-		SFTPWriteStart:    sftpWriteStart,
-		SFTPWriteEnd:      sftpWriteEnd,
-		SFTPWriteDuration: sftpWriteDuration,
 	}
 	return nil
 }
