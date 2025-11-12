@@ -56,7 +56,8 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from "vue";
 import { RemoteDriver } from 'vuefinder';
-import { WebSocketUploader } from './websocket-upload.js';
+import { WebSocketUploader } from './upload.js';
+import { formatSize, formatETA } from './utils.js';
 
 const vuefinderRef = ref(null);
 
@@ -86,28 +87,6 @@ const overallPercent = computed(() => {
   return Math.max(0, Math.min(100, p));
 });
 
-function formatSize(bytes) {
-  const b = Number(bytes) || 0;
-  if (b < 1024) return `${b} B`;
-  const units = ["KB", "MB", "GB", "TB"]; 
-  let val = b / 1024;
-  let i = 0;
-  while (val >= 1024 && i < units.length - 1) {
-    val /= 1024;
-    i++;
-  }
-  return `${val.toFixed(val >= 100 ? 0 : val >= 10 ? 1 : 2)} ${units[i]}`;
-}
-
-function formatETA(seconds) {
-  const s = Math.max(0, Math.floor(Number(seconds) || 0));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m ${sec}s`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
-}
 
 // 扩展 RemoteDriver 以支持自定义下载（使用原生下载，支持 Range，避免内存聚合）
 class CustomRemoteDriver extends RemoteDriver {
@@ -198,10 +177,6 @@ const customUploader = (uppy, context) => {
           _lastTime: Date.now(),
           _uiLastTs: 0,
           _emaSpeed: 0,
-          // 二段进度
-          sentLoaded: 0,
-          sftpLoaded: 0,
-          phase: 'sending', // sending | writing | done
         })
         uploadTasks.value.push(task)
 
@@ -209,7 +184,7 @@ const customUploader = (uppy, context) => {
           file,
           targetPath,
           (progress) => {
-            // 二段进度合并：发送阶段与写入阶段
+            // 统一单进度：取 offset 与 sftpWritten 的较大值作为可视化进度
             const now = Date.now()
 
             const sent = Number(progress.bytesUploaded) || 0
@@ -217,22 +192,11 @@ const customUploader = (uppy, context) => {
             const sftp = Number(progress.sftpWritten) || 0
 
             task.total = total
-            task.sentLoaded = Math.min(sent, total)
-            task.sftpLoaded = Math.min(sftp, total)
-
-            if (task.sentLoaded < total) {
-              task.phase = 'sending'
-              task.loaded = task.sentLoaded
-            } else if (task.sftpLoaded < total) {
-              task.phase = 'writing'
-              task.loaded = task.sftpLoaded
-            } else {
-              task.phase = 'done'
-              task.loaded = total
-            }
+            const vis = Math.max(sent, sftp)
+            task.loaded = Math.min(vis, total)
 
             // 仅在 1s 节拍时更新 UI 上的速度/ETA/进度，避免闪烁
-            if (now - task._uiLastTs >= UI_UPDATE_MS || task.phase === 'done') {
+            if (now - task._uiLastTs >= UI_UPDATE_MS || task.loaded >= total) {
               // 速度与 ETA（按当前阶段的基准进度计算）
               const basisLoaded = task.loaded
               const dt = Math.max(0.2, (now - task._lastTime) / 1000)
@@ -255,14 +219,6 @@ const customUploader = (uppy, context) => {
                 bytesUploaded: progress.bytesUploaded,
                 bytesTotal: progress.bytesTotal,
               })
-
-              // 触发数组层变更
-              uploadTasks.value = uploadTasks.value.slice()
-
-              try {
-                const percent = total ? Math.floor((task.loaded / total) * 100) : 0
-                console.log('[APP][progress-ui]', { percent, speed: task.speed, eta: task.etaSeconds, phase: task.phase })
-              } catch (_) {}
             }
           },
           (data) => {
@@ -271,7 +227,6 @@ const customUploader = (uppy, context) => {
             task.speed = 0
             task.etaSeconds = 0
             task.status = 'success'
-            task.phase = 'done'
             uppy.emit('upload-success', uppyFile, { status: 200, body: data })
           },
           (error) => {

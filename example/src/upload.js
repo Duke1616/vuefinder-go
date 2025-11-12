@@ -27,10 +27,6 @@ export class WebSocketUploader {
         const now = Date.now();
         if (now - _lastEmit < this._progressIntervalMs) return;
         _lastEmit = now;
-        try {
-          // 调试：发送阶段进度
-          console.log('[WS-UPLOAD][sending]', `${bytes}/${file.size}`);
-        } catch (_) {}
         if (onProgress) {
           onProgress({
             bytesUploaded: bytes,
@@ -65,10 +61,6 @@ export class WebSocketUploader {
             const sftpWritten = Number(msg.sftpWritten) || 0;
             const offset = Number(msg.offset) || 0; // 已接收
             const sftpPercent = total > 0 ? ((sftpWritten / total) * 100).toFixed(2) : '0.00';
-            try {
-              // 调试：服务端进度
-              console.log('[WS-UPLOAD][server]', { offset, sftpWritten, total, sftpPercent });
-            } catch (_) {}
             
             if (onProgress) {
               onProgress({
