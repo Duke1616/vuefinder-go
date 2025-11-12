@@ -1,0 +1,38 @@
+{
+  "name": "@nanostores/persistent",
+  "version": "1.2.0",
+  "description": "A store for Nano Stores state manager to keep data in localStorage",
+  "keywords": [
+    "nano",
+    "persistent",
+    "react",
+    "preact",
+    "vue",
+    "svelte",
+    "store",
+    "localStorage",
+    "cross-tab"
+  ],
+  "author": "Andrey Sitnik <andrey@sitnik.ru>",
+  "license": "MIT",
+  "repository": "nanostores/persistent",
+  "sideEffects": false,
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": "^20.0.0 || >=22.0.0"
+  },
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/ai"
+    }
+  ],
+  "peerDependencies": {
+    "nanostores": "^0.9.0 || ^0.10.0 || ^0.11.0 || ^1.0.0"
+  }
+}

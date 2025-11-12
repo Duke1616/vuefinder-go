@@ -1,7 +1,6 @@
 package web
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -59,14 +58,18 @@ type UploadSession struct {
 	mu       sync.RWMutex // 保护 Offset 的并发访问
 }
 
-// uploadWriter 实现 io.WriteCloser，用于流式写入到 SFTP
-// 使用 bytes.Buffer 累积数据，在 Close 时一次性写入
+// uploadWriter 边接边写：通过 io.Pipe 将收到的数据实时写入 SFTP
 type uploadWriter struct {
 	finder         finder.Finder
 	remoteDir      string
 	remoteFile     string
-	buffer         *bytes.Buffer
 	ctx            context.Context
+	totalSize      int64
+
+	pr  *io.PipeReader
+	pw  *io.PipeWriter
+	done chan error
+
 	closed         bool
 	sftpWriteStart time.Time                  // SFTP 写入开始时间
 	sftpWriteEnd   time.Time                  // SFTP 写入结束时间
@@ -75,11 +78,42 @@ type uploadWriter struct {
 	mu             sync.Mutex
 }
 
+func (w *uploadWriter) startWriterGoroutine() {
+	w.sftpWriteStart = time.Now()
+	go func() {
+		// 进度回调：更新 sftpWritten 并透传
+		progressCallback := func(written, total int64) {
+			w.mu.Lock()
+			w.sftpWritten = written
+			w.mu.Unlock()
+			if w.onProgress != nil {
+				w.onProgress(written, total)
+			}
+		}
+
+		err := w.finder.UploadStreamWithProgress(w.ctx, w.pr, w.remoteDir, w.remoteFile, w.totalSize, progressCallback)
+		w.sftpWriteEnd = time.Now()
+
+		// 确保最终写入字节与总大小一致（若后端未完整回调）
+		w.mu.Lock()
+		if w.sftpWritten < w.totalSize {
+			w.sftpWritten = w.totalSize
+		}
+		w.mu.Unlock()
+
+		w.done <- err
+		close(w.done)
+	}()
+}
+
 func (w *uploadWriter) Write(p []byte) (n int, err error) {
-	if w.buffer == nil {
-		w.buffer = &bytes.Buffer{}
+	if w.closed {
+		return 0, io.ErrClosedPipe
 	}
-	return w.buffer.Write(p)
+	if w.pw == nil {
+		return 0, fmt.Errorf("writer not initialized")
+	}
+	return w.pw.Write(p)
 }
 
 func (w *uploadWriter) Close() error {
@@ -87,42 +121,17 @@ func (w *uploadWriter) Close() error {
 		return nil
 	}
 	w.closed = true
-
-	if w.buffer == nil || w.buffer.Len() == 0 {
-		return nil
+	// 关闭写入端，通知后台写入完成
+	if w.pw != nil {
+		_ = w.pw.Close()
 	}
-
-	// 记录 SFTP 写入开始时间
-	w.sftpWriteStart = time.Now()
-
-	// 创建带进度跟踪的 reader
-	reader := bytes.NewReader(w.buffer.Bytes())
-	totalSize := int64(w.buffer.Len())
-
-	// 创建进度回调函数
-	progressCallback := func(written, total int64) {
-		w.mu.Lock()
-		w.sftpWritten = written
-		w.mu.Unlock()
-
-		// 调用外部进度回调（通过 WebSocket 发送）
-		if w.onProgress != nil {
-			w.onProgress(written, total)
+	// 等待后台 goroutine 结束
+	if w.done != nil {
+		if err, ok := <-w.done; ok {
+			return err
 		}
 	}
-
-	// 直接调用 UploadStreamWithProgress（现在接口中已定义）
-	err := w.finder.UploadStreamWithProgress(w.ctx, reader, w.remoteDir, w.remoteFile, totalSize, progressCallback)
-
-	// 记录 SFTP 写入结束时间
-	w.sftpWriteEnd = time.Now()
-
-	// 更新最终写入字节数
-	w.mu.Lock()
-	w.sftpWritten = totalSize
-	w.mu.Unlock()
-
-	return err
+	return nil
 }
 
 // GetSFTPWritten 获取已写入 SFTP 的字节数
@@ -164,13 +173,20 @@ func (w *uploadWriter) GetSFTPWriteEnd() int64 {
 }
 
 // createUploadWriter 创建上传写入器
-func createUploadWriter(ctx context.Context, fd finder.Finder, remoteDir, remoteFile string) (io.WriteCloser, error) {
-	return &uploadWriter{
+func createUploadWriter(ctx context.Context, fd finder.Finder, remoteDir, remoteFile string, totalSize int64) (io.WriteCloser, error) {
+	pr, pw := io.Pipe()
+	uw := &uploadWriter{
 		finder:     fd,
 		remoteDir:  remoteDir,
 		remoteFile: remoteFile,
 		ctx:        ctx,
-	}, nil
+		totalSize:  totalSize,
+		pr:         pr,
+		pw:         pw,
+		done:       make(chan error, 1),
+	}
+	uw.startWriterGoroutine()
+	return uw, nil
 }
 
 var upgrader = websocket.Upgrader{
@@ -327,8 +343,8 @@ func cleanupSession(sessions map[string]*UploadSession, mu *sync.RWMutex, id str
 
 // handleStartUpload 处理开始上传
 func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd finder.Finder, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
-	// 创建流式写入器
-	writer, err := createUploadWriter(ctx, fd, msg.Path, msg.FileName)
+	// 创建流式写入器（传入总大小用于进度计算）
+	writer, err := createUploadWriter(ctx, fd, msg.Path, msg.FileName, msg.Size)
 	if err != nil {
 		return fmt.Errorf("创建上传流失败: %w", err)
 	}

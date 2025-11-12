@@ -12,8 +12,8 @@ importers:
         specifier: ^3.5.13
         version: 3.5.13
       vuefinder:
-        specifier: ^4.0.6
-        version: 4.0.6(vite@6.0.4(jiti@2.6.1)(lightningcss@1.30.2)(sass-embedded@1.83.0))(vue@3.5.13)
+        specifier: ^4.0.14
+        version: 4.0.14(vite@6.0.4(jiti@2.6.1)(lightningcss@1.30.2)(sass-embedded@1.83.0))(vue@3.5.13)
     devDependencies:
       '@vitejs/plugin-vue':
         specifier: ^5.2.1
@@ -1503,6 +1503,20 @@ packages:
       '@vue/composition-api':
         optional: true
 
+  vue-sonner@2.0.9:
+    resolution: {integrity: sha512-i6BokNlNDL93fpzNxN/LZSn6D6MzlO+i3qXt6iVZne3x1k7R46d5HlFB4P8tYydhgqOrRbIZEsnRd3kG7qGXyw==}
+    peerDependencies:
+      '@nuxt/kit': ^4.0.3
+      '@nuxt/schema': ^4.0.3
+      nuxt: ^4.0.3
+    peerDependenciesMeta:
+      '@nuxt/kit':
+        optional: true
+      '@nuxt/schema':
+        optional: true
+      nuxt:
+        optional: true
+
   vue@3.5.13:
     resolution: {integrity: sha512-wmeiSMxkZCSc+PM2w2VRsOYAZC8GdipNFRTsLSfodVqI9mbejKeXEGr8SckuLnrQPGe3oJN5c3K0vpoU9q/wCQ==}
     peerDependencies:
@@ -1511,8 +1525,8 @@ packages:
       typescript:
         optional: true
 
-  vuefinder@4.0.6:
-    resolution: {integrity: sha512-GjM63h+oBn7e7mNzly1qj0jSm9Ux5COSpg0U54rW2Kl1Pw4cFS1G/cEEz3GvFW4pLfs9F9REZJ9SgL2veSUaUg==}
+  vuefinder@4.0.14:
+    resolution: {integrity: sha512-4DBwWWfTtCDQ5KDf/G5jcynfuFjLnKEGBMCmiZuUqU5JOZrMFfr+LE+IKSpyTcsppdm0Tk0sZ1Y+w340hLh+wA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     peerDependencies:
       vue: ^3.5.22
@@ -2851,6 +2865,8 @@ snapshots:
     dependencies:
       vue: 3.5.13
 
+  vue-sonner@2.0.9: {}
+
   vue@3.5.13:
     dependencies:
       '@vue/compiler-dom': 3.5.13
@@ -2859,7 +2875,7 @@ snapshots:
       '@vue/server-renderer': 3.5.13(vue@3.5.13)
       '@vue/shared': 3.5.13
 
-  vuefinder@4.0.6(vite@6.0.4(jiti@2.6.1)(lightningcss@1.30.2)(sass-embedded@1.83.0))(vue@3.5.13):
+  vuefinder@4.0.14(vite@6.0.4(jiti@2.6.1)(lightningcss@1.30.2)(sass-embedded@1.83.0))(vue@3.5.13):
     dependencies:
       '@floating-ui/dom': 1.7.4
       '@nanostores/persistent': 1.2.0(nanostores@1.0.1)
@@ -2873,6 +2889,7 @@ snapshots:
       '@uppy/xhr-upload': 5.0.2(@uppy/core@5.1.1)
       '@viselect/vanilla': 3.9.0
       '@vueuse/core': 13.9.0(vue@3.5.13)
+      mitt: 3.0.1
       nanostores: 1.0.1
       overlayscrollbars: 2.12.0
       tailwindcss: 4.1.17
@@ -2880,8 +2897,11 @@ snapshots:
       vite-svg-loader: 5.1.0(vue@3.5.13)
       vue: 3.5.13
       vue-advanced-cropper: 2.8.9(vue@3.5.13)
+      vue-sonner: 2.0.9
     transitivePeerDependencies:
       - '@nanostores/logger'
+      - '@nuxt/kit'
+      - '@nuxt/schema'
       - '@uppy/dashboard'
       - '@uppy/image-editor'
       - '@uppy/screen-capture'
@@ -2889,6 +2909,7 @@ snapshots:
       - '@uppy/webcam'
       - '@vue/composition-api'
       - '@vue/devtools-api'
+      - nuxt
       - vite
 
   which@2.0.2:

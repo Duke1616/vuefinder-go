@@ -1,0 +1,50 @@
+import type { Body, I18n, Meta, UppyFile } from '@uppy/utils';
+import type { NonNullableUppyOptions, State } from './Uppy.js';
+export type Restrictions = {
+    maxFileSize: number | null;
+    minFileSize: number | null;
+    maxTotalFileSize: number | null;
+    maxNumberOfFiles: number | null;
+    minNumberOfFiles: number | null;
+    allowedFileTypes: string[] | null;
+    requiredMetaFields: string[];
+};
+/**
+ * The minimal required properties to be present from UppyFile in order to validate it.
+ */
+export type ValidateableFile<M extends Meta, B extends Body> = Pick<UppyFile<M, B>, 'type' | 'extension' | 'size'> & Partial<Pick<UppyFile<M, B>, 'name' | 'isGhost'>>;
+declare const defaultOptions: {
+    maxFileSize: null;
+    minFileSize: null;
+    maxTotalFileSize: null;
+    maxNumberOfFiles: null;
+    minNumberOfFiles: null;
+    allowedFileTypes: null;
+    requiredMetaFields: never[];
+};
+declare class RestrictionError<M extends Meta, B extends Body> extends Error {
+    isUserFacing: boolean;
+    file: UppyFile<M, B>;
+    constructor(message: string, opts?: {
+        isUserFacing?: boolean;
+        file?: UppyFile<M, B>;
+    });
+    isRestriction: boolean;
+}
+declare class Restricter<M extends Meta, B extends Body> {
+    getI18n: () => I18n;
+    getOpts: () => NonNullableUppyOptions<M, B>;
+    constructor(getOpts: () => NonNullableUppyOptions<M, B>, getI18n: () => I18n);
+    validateAggregateRestrictions(existingFiles: ValidateableFile<M, B>[], addingFiles: ValidateableFile<M, B>[]): void;
+    validateSingleFile(file: ValidateableFile<M, B>): void;
+    validate(existingFiles: ValidateableFile<M, B>[], addingFiles: ValidateableFile<M, B>[]): void;
+    validateMinNumberOfFiles(files: State<M, B>['files']): void;
+    getMissingRequiredMetaFields(file: ValidateableFile<M, B> & {
+        meta: M;
+    }): {
+        missingFields: string[];
+        error: RestrictionError<M, B>;
+    };
+}
+export { Restricter, defaultOptions, RestrictionError };
+//# sourceMappingURL=Restricter.d.ts.map
