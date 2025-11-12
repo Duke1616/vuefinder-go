@@ -3,6 +3,7 @@ package web
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strconv"
@@ -16,6 +17,49 @@ import (
 
 type Handler struct {
 	finders map[int64]finder.Finder
+}
+
+// DownloadStream 使用 http.ServeContent 实现流式下载，自动支持 Range/206
+func (h *Handler) DownloadStream(ctx *gin.Context) {
+	file := ctx.Query("path")
+
+	fd, err := h.getFinder(ctx)
+	if err != nil {
+		ctx.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	ra, size, modTime, name, closer, err := fd.Open(ctx, file)
+	if err != nil {
+		ctx.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer closer.Close()
+
+	// 解析路径获取文件名作为回退
+	actualPath := file
+	if strings.Contains(file, "://") {
+		parts := strings.SplitN(file, "://", 2)
+		if len(parts) > 1 {
+			actualPath = parts[1]
+		}
+	}
+	fallbackName := path.Base(actualPath)
+	if name == "" {
+		name = fallbackName
+	}
+
+	// 基本头部
+	ctx.Header("Content-Description", "File Transfer")
+	ctx.Header("Content-Transfer-Encoding", "binary")
+	ctx.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", path.Base(name)))
+	// Content-Type 采用通用类型，浏览器可根据文件名自行判断
+	ctx.Header("Content-Type", "application/octet-stream")
+	ctx.Header("Accept-Ranges", "bytes")
+
+	// 使用 SectionReader 将 ReaderAt 适配为 ReadSeeker，交给 ServeContent 自动处理 Range/缓存
+	rs := io.NewSectionReader(ra, 0, size)
+	http.ServeContent(ctx.Writer, ctx.Request, name, modTime, rs)
 }
 
 func NewHandler() *Handler {
@@ -42,7 +86,7 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g := server.Group("/api/finder")
 
 	g.GET("/files", ginx.Wrap(h.Index))
-	g.GET("/download", ginx.WrapData(h.Download))
+	g.GET("/download", h.DownloadStream)
 	g.GET("/search", ginx.Wrap(h.Search))
 	g.GET("/preview", ginx.WrapBuff(h.Preview))
 	// 注意：上传路由已经在 RegisterUploadRoute 中注册（流式上传，支持实时进度）
@@ -62,10 +106,13 @@ func (h *Handler) SetFinder(id int64, f finder.Finder) {
 
 func (h *Handler) getFinder(ctx *gin.Context) (finder.Finder, error) {
 	finderID := ctx.GetHeader("x-finder-id")
-	id, err := strconv.ParseInt(finderID, 10, 64)
+	if finderID == "" {
+		finderID = ctx.Query("id")
+	}
 
+	id, err := strconv.ParseInt(finderID, 10, 64)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid finder id: %w", err)
 	}
 
 	fd, ok := h.finders[id]

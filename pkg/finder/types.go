@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"mime/multipart"
+	"time"
 )
 
 type FileType string
@@ -23,6 +24,14 @@ type Finder interface {
 	UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string,
 		totalSize int64, onProgress func(written, total int64)) error
 	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
+	// Open 打开一个可随机读取的文件视图，用于流式下载/断点续传。
+	// 返回值：
+	//  - ra: 实现了 io.ReaderAt 的读取器
+	//  - size: 文件大小（字节）
+	//  - modTime: 文件的修改时间
+	//  - name: 建议的文件名
+	//  - closer: 调用方在读取结束后必须关闭
+	Open(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error)
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
 	NewFile(ctx context.Context, file, name string) error

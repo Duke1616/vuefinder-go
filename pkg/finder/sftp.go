@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ecodeclub/ekit/slice"
 	"github.com/pkg/sftp"
@@ -384,6 +385,35 @@ func (sf *sftpFinder) Download(ctx context.Context, filePath string) (bytes.Buff
 	}
 
 	return buff, nil
+}
+
+// Open 打开远程文件并返回可随机读取的视图，用于流式下载/断点续传
+func (sf *sftpFinder) Open(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error) {
+    // 解析路径为实际文件系统路径
+    actualPath := parseVueFinderPath(filePath)
+
+    // 打开文件
+    f, e := sf.client.Open(actualPath)
+    if e != nil {
+        err = e
+        return
+    }
+
+    // 获取文件信息
+    info, e := f.Stat()
+    if e != nil {
+        f.Close()
+        err = e
+        return
+    }
+
+    // 返回 ReaderAt（*sftp.File 实现了 ReadAt）、大小、修改时间、名称和关闭器
+    ra = f
+    size = info.Size()
+    modTime = info.ModTime()
+    name = info.Name()
+    closer = f
+    return
 }
 
 func (sf *sftpFinder) Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error {

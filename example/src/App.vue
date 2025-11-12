@@ -25,40 +25,18 @@ const vuefinderRef = ref(null);
 const BASE_URL = "http://127.0.0.1:8350/api/finder";
 const FINDER_ID = 20;
 
-// 扩展 RemoteDriver 以支持自定义下载
+// 扩展 RemoteDriver 以支持自定义下载（使用原生下载，支持 Range，避免内存聚合）
 class CustomRemoteDriver extends RemoteDriver {
-  async download(filePath, fileName) {
+  async download(filePath) {
     try {
-      const url = `${BASE_URL}/download?path=${encodeURIComponent(filePath)}`;
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-Finder-ID': String(FINDER_ID),
-        },
-      });
-      
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.message || '下载失败');
-      }
-      
-      // 获取文件名
-      const contentDisposition = response.headers.get('Content-Disposition');
-      const finalFileName = contentDisposition
-        ? contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)?.[1]?.replace(/['"]/g, '') || fileName || filePath.split('/').pop()
-        : fileName || filePath.split('/').pop();
-      
-      // 下载文件
-      const blob = await response.blob();
-      const downloadUrl = URL.createObjectURL(blob);
+      const url = `${BASE_URL}/download?path=${encodeURIComponent(filePath)}&id=${encodeURIComponent(String(FINDER_ID))}`;
       const link = document.createElement('a');
-      link.href = downloadUrl;
-      link.download = finalFileName;
+      link.href = url;
+      link.rel = 'noopener noreferrer';
       link.style.display = 'none';
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(downloadUrl);
     } catch (error) {
       console.error('下载失败:', error);
       alert(`下载失败: ${error.message}`);
