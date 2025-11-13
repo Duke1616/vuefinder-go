@@ -1,4 +1,4 @@
-package finder
+package sftp
 
 import (
 	"fmt"
@@ -10,10 +10,6 @@ import (
 
 	"github.com/pkg/sftp"
 )
-
-type sftpFinder struct {
-	client *sftp.Client
-}
 
 func (s *sftpUploadSession) FinalPath() string {
 	s.mu.Lock()

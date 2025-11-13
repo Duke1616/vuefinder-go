@@ -12,12 +12,18 @@ import (
 
 	"github.com/Duke1616/vuefinder-go/pkg/finder"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
+	"github.com/Duke1616/vuefinder-go/pkg/provider"
 	"github.com/ecodeclub/ekit/slice"
 	"github.com/gin-gonic/gin"
 )
 
 type Handler struct {
-	finders map[int64]finder.Finder
+	finders map[int64]provider.CapabilityProvider
+}
+
+// getCaps 仅允许通过 CapabilityProvider 提供能力集合
+func getCaps(fd provider.CapabilityProvider) *provider.Capabilities {
+	return fd.Caps()
 }
 
 // DownloadStream 使用 http.ServeContent 实现流式下载，自动支持 Range/206
@@ -30,19 +36,21 @@ func (h *Handler) DownloadStream(ctx *gin.Context) {
 		return
 	}
 
-	rd, ok := fd.(finder.Readable)
-	if !ok {
+	caps := getCaps(fd)
+	if caps == nil || caps.Readable == nil {
 		ctx.String(http.StatusInternalServerError, "finder does not support download")
 		return
 	}
-	ra, size, modTime, name, closer, err := rd.OpenRead(ctx, file)
+	rd := caps.Readable
+	ra, size, modTime, name, closer, err := rd.OpenRead(ctx.Request.Context(), file)
 	if err != nil {
 		ctx.String(http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 包装一个可自动重开的 ReaderAt，提升大文件下载的稳定性
-	wrapped := newRetryReaderAt(ra, closer, 3, func() (io.ReaderAt, io.Closer, error) {
-		nra, _, _, _, ncloser, e := rd.OpenRead(ctx, file)
+	// 包装一个可自动重开的 ReaderAt，提升大文件下载的稳健性
+	maxRetry := 3
+	wrapped := newRetryReaderAt(ra, closer, maxRetry, func() (io.ReaderAt, io.Closer, error) {
+		nra, _, _, _, ncloser, e := rd.OpenRead(ctx.Request.Context(), file)
 		if e != nil {
 			return nil, nil, e
 		}
@@ -50,13 +58,11 @@ func (h *Handler) DownloadStream(ctx *gin.Context) {
 	})
 	defer wrapped.Close()
 
-	// 解析路径获取文件名作为回退
+	// 解析路径获取文件名作为回退（使用统一 Locator）
+	loc, pErr := finder.ParseLocator(file)
 	actualPath := file
-	if strings.Contains(file, "://") {
-		parts := strings.SplitN(file, "://", 2)
-		if len(parts) > 1 {
-			actualPath = parts[1]
-		}
+	if pErr == nil && loc.Opaque != "" {
+		actualPath = loc.Opaque
 	}
 	fallbackName := path.Base(actualPath)
 	if name == "" {
@@ -77,9 +83,11 @@ func (h *Handler) DownloadStream(ctx *gin.Context) {
 }
 
 func NewHandler() *Handler {
-	return &Handler{
-		finders: make(map[int64]finder.Finder),
-	}
+	return NewHandlerWithConfig()
+}
+
+func NewHandlerWithConfig() *Handler {
+	return &Handler{finders: make(map[int64]provider.CapabilityProvider)}
 }
 
 // RegisterUploadRoute 单独注册上传路由，在中间件之前
@@ -111,14 +119,14 @@ func (h *Handler) RegisterRoutes(server *gin.Engine) {
 	g.POST("/archive", ginx.WrapBody(h.Archive))
 	g.POST("/unarchive", ginx.WrapBody(h.Unarchive))
 	g.POST("/save", ginx.WrapBuffBody(h.Save))
-	g.DELETE("/delete", ginx.WrapBody(h.Delete))
+	g.POST("/delete", ginx.WrapBody(h.Delete))
 }
 
-func (h *Handler) SetFinder(id int64, f finder.Finder) {
+func (h *Handler) SetFinder(id int64, f provider.CapabilityProvider) {
 	h.finders[id] = f
 }
 
-func (h *Handler) getFinder(ctx *gin.Context) (finder.Finder, error) {
+func (h *Handler) getFinder(ctx *gin.Context) (provider.CapabilityProvider, error) {
 	finderID := ctx.GetHeader("x-finder-id")
 	if finderID == "" {
 		finderID = ctx.Query("id")
@@ -143,7 +151,11 @@ func (h *Handler) Save(ctx *gin.Context, req SaveReq) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Save(ctx, req.Path, req.Content)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Save(ctx.Request.Context(), req.Path, req.Content)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -158,9 +170,11 @@ func (h *Handler) Preview(ctx *gin.Context) (ginx.Result, error) {
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
-
-	// 获取文件内容
-	buff, err := fd.Preview(ctx, pathQuery)
+	caps := getCaps(fd)
+	if caps == nil || caps.Previewer == nil {
+		return ginx.Result{Message: "finder does not support preview"}, fmt.Errorf("preview not supported")
+	}
+	buff, err := caps.Previewer.Preview(ctx.Request.Context(), pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -184,8 +198,11 @@ func (h *Handler) Search(ctx *gin.Context) (ginx.Result, error) {
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
-
-	storages, err := fd.Search(ctx, adapter, pathQuery, filter)
+	caps := getCaps(fd)
+	if caps == nil || caps.Searcher == nil {
+		return ginx.Result{Message: "finder does not support search"}, fmt.Errorf("search not supported")
+	}
+	storages, err := caps.Searcher.Search(ctx.Request.Context(), adapter, pathQuery, filter)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
@@ -218,19 +235,25 @@ func (h *Handler) Archive(ctx *gin.Context, req ArchiveReq) (ginx.Result, error)
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Archive(ctx, toFinderItems(req.Items), targetPath, basePath)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Archive(ctx.Request.Context(), toFinderItems(req.Items), targetPath, basePath)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, basePath)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), basePath)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) Unarchive(ctx *gin.Context, req UnarchiveReq) (ginx.Result, error) {
@@ -247,40 +270,46 @@ func (h *Handler) Unarchive(ctx *gin.Context, req UnarchiveReq) (ginx.Result, er
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Unarchive(ctx, req.Item, req.Path)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Unarchive(ctx.Request.Context(), req.Item, req.Path)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) Move(ctx *gin.Context, req MoveReq) (ginx.Result, error) {
 	// 兼容前端可能使用的不同字段名
 	// 优先使用 sources/destination，如果没有则使用 items/item
-	var items []Item
+	var items []finder.Item
 	var target string
 
 	// 如果 sources 是字符串数组，需要转换为 Item 数组
 	if len(req.Sources) > 0 {
-		items = make([]Item, 0, len(req.Sources))
+		items = make([]finder.Item, 0, len(req.Sources))
 		for _, sourcePath := range req.Sources {
 			// 从路径推断类型（这里简化处理，实际可能需要查询文件系统）
 			// 暂时都设置为 FILE，如果需要可以后续优化
-			items = append(items, Item{
+			items = append(items, finder.Item{
 				Path: sourcePath,
 				Type: finder.FILE, // 默认类型，可以根据需要调整
 			})
 		}
 	} else {
-		items = req.Items
+		items = toFinderItems(req.Items)
 	}
 
 	if req.Destination != "" {
@@ -302,20 +331,26 @@ func (h *Handler) Move(ctx *gin.Context, req MoveReq) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Move(ctx, toFinderItems(items), target)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Move(ctx.Request.Context(), items, target)
 
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) Delete(ctx *gin.Context, req DeleteReq) (ginx.Result, error) {
@@ -324,19 +359,25 @@ func (h *Handler) Delete(ctx *gin.Context, req DeleteReq) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Delete(ctx, toFinderItems(req.Items), req.Path)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Delete(ctx.Request.Context(), toFinderItems(req.Items), req.Path)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) Rename(ctx *gin.Context, req RenameReq) (ginx.Result, error) {
@@ -345,19 +386,25 @@ func (h *Handler) Rename(ctx *gin.Context, req RenameReq) (ginx.Result, error) {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.Rename(ctx, req.Item, req.Name, req.Path)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.Rename(ctx.Request.Context(), req.Item, req.Name, req.Path)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) NewFile(ctx *gin.Context, req NewFileReq) (ginx.Result, error) {
@@ -366,19 +413,25 @@ func (h *Handler) NewFile(ctx *gin.Context, req NewFileReq) (ginx.Result, error)
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.NewFile(ctx, req.Path, req.Name)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.NewFile(ctx.Request.Context(), req.Path, req.Name)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
+		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
+	return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
 }
 
 func (h *Handler) NewFolder(ctx *gin.Context, req NewFolderReq) (ginx.Result, error) {
@@ -387,53 +440,25 @@ func (h *Handler) NewFolder(ctx *gin.Context, req NewFolderReq) (ginx.Result, er
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	err = fd.NewFolder(ctx, req.Path, req.Name)
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+	err = caps.Writer.NewFolder(ctx.Request.Context(), req.Path, req.Name)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
 
-	storage, err := fd.Index(ctx, req.Path)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
-	}
-
-	return ginx.Result{
-		Data: storage,
-	}, nil
-}
-
-func (h *Handler) Download(ctx *gin.Context) (ginx.Result, error) {
-	file := ctx.Query("path")
-
-	fd, err := h.getFinder(ctx)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
-	}
-
-	buff, err := fd.Download(ctx, file)
-	if err != nil {
-		return ginx.Result{Message: err.Error()}, err
-	}
-
-	// 解析路径获取文件名
-	actualPath := file
-	if strings.Contains(file, "://") {
-		parts := strings.SplitN(file, "://", 2)
-		if len(parts) > 1 {
-			actualPath = parts[1]
+	if caps.Lister != nil {
+		storage, err := caps.Lister.Index(ctx.Request.Context(), req.Path)
+		if err != nil {
+			return ginx.Result{Message: err.Error()}, err
 		}
+		return ginx.Result{
+			Data: storage,
+		}, nil
 	}
-	fileName := path.Base(actualPath)
-
-	// 设置响应头
-	ctx.Header("Content-Description", "File Transfer")
-	ctx.Header("Content-Transfer-Encoding", "binary")
-	ctx.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
-	ctx.Header("Content-Type", "application/octet-stream")
-
-	return ginx.Result{
-		Data: buff.Bytes(),
-	}, nil
+	return ginx.Result{Message: "finder does not support list"}, fmt.Errorf("list not supported")
 }
 
 func (h *Handler) Upload(ctx *gin.Context) (ginx.Result, error) {
@@ -469,6 +494,11 @@ func (h *Handler) uploadWithFormFile(ctx *gin.Context) (ginx.Result, error) {
 		return ginx.Result{Message: fmt.Sprintf("获取 Finder 失败: %v", err)}, err
 	}
 
+	caps := getCaps(fd)
+	if caps.Writer == nil {
+		return ginx.Result{Message: "finder does not support writer"}, fmt.Errorf("writer capability missing")
+	}
+
 	// 打开文件流进行流式上传
 	srcFile, err := srcFileHeader.Open()
 	if err != nil {
@@ -477,13 +507,13 @@ func (h *Handler) uploadWithFormFile(ctx *gin.Context) (ginx.Result, error) {
 	defer srcFile.Close()
 
 	// 使用流式上传
-	err = fd.UploadStream(ctx, srcFile, remoteDir, remoteFile)
+	err = caps.Writer.UploadStream(ctx.Request.Context(), srcFile, remoteDir, remoteFile)
 	if err != nil {
 		return ginx.Result{Message: fmt.Sprintf("上传文件失败: %v", err)}, err
 	}
 
 	// 上传成功后，返回当前目录的文件列表，以便前端刷新
-	storage, err := fd.Index(ctx, remoteDir)
+	storage, err := caps.Lister.Index(ctx.Request.Context(), remoteDir)
 	if err != nil {
 		return ginx.Result{Message: fmt.Sprintf("获取文件列表失败: %v", err)}, err
 	}
@@ -501,8 +531,11 @@ func (h *Handler) Index(ctx *gin.Context) (ginx.Result, error) {
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}
-
-	data, err := fd.Index(ctx, pathQuery)
+	caps := getCaps(fd)
+	if caps == nil || caps.Lister == nil {
+		return ginx.Result{Message: "finder does not support index"}, fmt.Errorf("index not supported")
+	}
+	data, err := caps.Lister.Index(ctx.Request.Context(), pathQuery)
 	if err != nil {
 		return ginx.Result{Message: err.Error()}, err
 	}

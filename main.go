@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Duke1616/vuefinder-go/pkg/finder"
+	sftpProvider "github.com/Duke1616/vuefinder-go/pkg/provider/sftp"
 	"github.com/Duke1616/vuefinder-go/pkg/ginx"
 	"github.com/Duke1616/vuefinder-go/pkg/web"
 	"github.com/gin-gonic/gin"
@@ -83,7 +83,7 @@ func run(cmd *cobra.Command, args []string) {
 	}
 	defer sftpClient.Close()
 
-	f := finder.NewSftpFinder(sftpClient)
+	f := sftpProvider.NewSftpFinder(sftpClient)
 	handler := web.NewHandler()
 	handler.SetFinder(20, f)
 	mlds := ginx.NewMiddleware()

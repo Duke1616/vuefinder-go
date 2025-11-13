@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Duke1616/vuefinder-go/pkg/finder"
+	"github.com/Duke1616/vuefinder-go/pkg/provider"
 	"github.com/gorilla/websocket"
 )
 
@@ -54,22 +54,22 @@ type UploadSession struct {
 	FileName string
 	Path     string
 	Size     int64
-	Sess     finder.UploadSession
-	Finder   finder.Finder
+	Sess     provider.UploadSession
+	Finder   provider.CapabilityProvider
 	Offset   int64
 	mu       sync.RWMutex // 保护 Offset 的并发访问
 }
 
 // uploadWriter 边接边写：通过 io.Pipe 将收到的数据实时写入 SFTP
 type uploadWriter struct {
-	finder         finder.Finder
-	remoteDir      string
-	remoteFile     string
-	ctx            context.Context
-	totalSize      int64
+	writer     provider.Writer
+	remoteDir  string
+	remoteFile string
+	ctx        context.Context
+	totalSize  int64
 
-	pr  *io.PipeReader
-	pw  *io.PipeWriter
+	pr   *io.PipeReader
+	pw   *io.PipeWriter
 	done chan error
 
 	closed         bool
@@ -93,7 +93,7 @@ func (w *uploadWriter) startWriterGoroutine() {
 			}
 		}
 
-		err := w.finder.UploadStreamWithProgress(w.ctx, w.pr, w.remoteDir, w.remoteFile, w.totalSize, progressCallback)
+		err := w.writer.UploadStreamWithProgress(w.ctx, w.pr, w.remoteDir, w.remoteFile, w.totalSize, progressCallback)
 		w.sftpWriteEnd = time.Now()
 
 		// 确保最终写入字节与总大小一致（若后端未完整回调）
@@ -175,10 +175,14 @@ func (w *uploadWriter) GetSFTPWriteEnd() int64 {
 }
 
 // createUploadWriter 创建上传写入器
-func createUploadWriter(ctx context.Context, fd finder.Finder, remoteDir, remoteFile string, totalSize int64) (io.WriteCloser, error) {
+func createUploadWriter(ctx context.Context, fd provider.CapabilityProvider, remoteDir, remoteFile string, totalSize int64) (io.WriteCloser, error) {
 	pr, pw := io.Pipe()
+	caps := getCaps(fd)
+	if caps == nil || caps.Writer == nil {
+		return nil, fmt.Errorf("finder does not support writer")
+	}
 	uw := &uploadWriter{
-		finder:     fd,
+		writer:     caps.Writer,
 		remoteDir:  remoteDir,
 		remoteFile: remoteFile,
 		ctx:        ctx,
@@ -365,12 +369,12 @@ func cleanupSession(sessions map[string]*UploadSession, mu *sync.RWMutex, id str
 }
 
 // handleStartUpload 处理开始上传
-func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd finder.Finder, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
-	ru, ok := fd.(finder.ResumableUploader)
-	if !ok {
+func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *UploadMessage, fd provider.CapabilityProvider, sessions map[string]*UploadSession, mu *sync.RWMutex) error {
+	caps := getCaps(fd)
+	if caps == nil || caps.ResumableUploader == nil {
 		return fmt.Errorf("finder does not support resumable upload")
 	}
-	sess, err := ru.OpenUpload(ctx, msg.Path, msg.FileName)
+	sess, err := caps.ResumableUploader.OpenUpload(ctx, msg.Path, msg.FileName)
 	if err != nil {
 		return fmt.Errorf("创建上传会话失败: %w", err)
 	}
@@ -386,7 +390,7 @@ func handleStartUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *U
 	if remoteSize >= msg.Size && msg.Size > 0 {
 		_ = sess.Abort()
 		_ = sess.Close()
-		sess, err = ru.OpenUpload(ctx, msg.Path, msg.FileName)
+		sess, err = caps.ResumableUploader.OpenUpload(ctx, msg.Path, msg.FileName)
 		if err != nil {
 			return fmt.Errorf("重置上传会话失败: %w", err)
 		}
@@ -496,7 +500,11 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 	)
 
 	// 获取文件列表（使用请求上下文）
-	storage, err := session.Finder.Index(ctx, session.Path)
+	caps := getCaps(session.Finder)
+	if caps == nil || caps.Lister == nil {
+		return fmt.Errorf("finder does not support index")
+	}
+	storage, err := caps.Lister.Index(ctx, session.Path)
 	if err != nil {
 		return fmt.Errorf("获取文件列表失败: %w", err)
 	}
@@ -511,10 +519,10 @@ func handleEndUpload(ctx context.Context, msgChan chan<- UploadMessage, msg *Upl
 		return fmt.Errorf("序列化文件列表失败: %w", err)
 	}
 	msgChan <- UploadMessage{
-		Type:              wsMsgTypeSuccess,
-		ID:                msg.ID,
-		Data:              successData,
-		FinalName:         finalName,
+		Type:      wsMsgTypeSuccess,
+		ID:        msg.ID,
+		Data:      successData,
+		FinalName: finalName,
 	}
 	return nil
 }

@@ -1,20 +1,12 @@
-package finder
+package provider
 
 import (
 	"bytes"
 	"context"
 	"io"
-	"mime/multipart"
 	"time"
-)
 
-type FileType string
-
-const (
-	DIR        FileType = "dir"
-	FILE       FileType = "file"
-	LINK       FileType = "link"
-	BrokenLINK FileType = "broken-link"
+	finder "github.com/Duke1616/vuefinder-go/pkg/finder"
 )
 
 // UploadSession 表示一个可在远端随机写入并可提交/回滚的上传会话
@@ -33,25 +25,58 @@ type UploadSession interface {
 	FinalPath() string
 }
 
-type Finder interface {
-	Index(ctx context.Context, path string) (Storages, error)
-	Upload(ctx context.Context, src *multipart.FileHeader, remoteDir, remoteFile string) error
+// Capabilities 组合各能力接口，后端可通过 CapabilityProvider 暴露自身能力
+type Capabilities struct {
+	Readable          Readable
+	Writer            Writer
+	Lister            Lister
+	Searcher          Searcher
+	Previewer         Previewer
+	ResumableUploader ResumableUploader
+}
+
+// CapabilityProvider 由后端实现，用于一次性提供自身具备的能力
+type CapabilityProvider interface {
+	Caps() *Capabilities
+}
+
+// Lister 提供目录/文件列表能力（与前端列表对齐）
+type Lister interface {
+	Index(ctx context.Context, path string) (finder.Storages, error)
+}
+
+// Searcher 提供搜索能力
+type Searcher interface {
+	Search(ctx context.Context, adapter, path, filter string) (finder.Storages, error)
+}
+
+// Previewer 提供预览能力
+type Previewer interface {
+	Preview(ctx context.Context, path string) (bytes.Buffer, error)
+}
+
+// Writer 聚合所有写入/修改类能力，简化调用方
+type Writer interface {
+	// UploadStream 上传（基础流式）
 	UploadStream(ctx context.Context, src io.Reader, remoteDir, remoteFile string) error
 	UploadStreamWithProgress(ctx context.Context, src io.Reader, remoteDir, remoteFile string,
 		totalSize int64, onProgress func(written, total int64)) error
-	Download(ctx context.Context, filePath string) (bytes.Buffer, error)
+
+	// Rename 变更/创建/移动
 	Rename(ctx context.Context, oldPathName, newName, path string) error
 	NewFolder(ctx context.Context, file, name string) error
 	NewFile(ctx context.Context, file, name string) error
 	RemoveDir(ctx context.Context, file string) error
 	RemoveFile(ctx context.Context, file string) error
-	Archive(ctx context.Context, items []Item, target, base string) error
+	Move(ctx context.Context, items []finder.Item, target string) error
+
+	// Archive 归档/解压
+	Archive(ctx context.Context, items []finder.Item, target, base string) error
 	Unarchive(ctx context.Context, archivePath, targetDir string) error
-	Move(ctx context.Context, items []Item, target string) error
-	Preview(ctx context.Context, path string) (bytes.Buffer, error)
-	Delete(ctx context.Context, items []Item, path string) error
-	Search(ctx context.Context, adapter, path, filter string) (Storages, error)
+	
+	// Save 保存/删除
 	Save(ctx context.Context, path, content string) error
+	Delete(ctx context.Context, items []finder.Item, path string) error
 }
 
 // ResumableUploader 提供断点续传直写能力（可与 Finder 解耦）
@@ -70,39 +95,4 @@ type Readable interface {
 	//  - name: 建议的文件名
 	//  - closer: 调用方在读取结束后必须关闭
 	OpenRead(ctx context.Context, filePath string) (ra io.ReaderAt, size int64, modTime time.Time, name string, closer io.Closer, err error)
-}
-
-type Storages struct {
-	Storages []string   `json:"storages"`
-	Dirname  string     `json:"dirname"`
-	Files    []FileInfo `json:"files"`
-}
-
-type FileInfo struct {
-	Type          FileType `json:"type"`
-	Dir           string   `json:"dir"`
-	Path          string   `json:"path"`
-	Visibility    string   `json:"visibility"`
-	LastModified  int64    `json:"last_modified"`
-	MimeType      string   `json:"mime_type"`
-	ExtraMetadata []string `json:"extra_metadata"`
-	Basename      string   `json:"basename"`
-	Extension     string   `json:"extension"`
-	Storage       string   `json:"storage"`
-	FileSize      int64    `json:"file_size"`
-	ReadOnly      bool     `json:"read_only,omitempty"`
-	PreviewUrl    string   `json:"preview_url,omitempty"`
-}
-
-type Item struct {
-	Path string   `json:"path"`
-	Type FileType `json:"type"`
-}
-
-func (f FileType) IsDir() bool {
-	return f == DIR
-}
-
-func (f FileType) IsFile() bool {
-	return f == FILE
 }

@@ -1,4 +1,4 @@
-package finder
+package sftp
 
 import (
 	"archive/zip"
@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Duke1616/vuefinder-go/pkg/finder"
+	"github.com/Duke1616/vuefinder-go/pkg/provider"
 	"github.com/ecodeclub/ekit/slice"
 	"github.com/pkg/sftp"
 )
@@ -25,7 +27,7 @@ const (
 )
 
 // OpenUpload 打开（或创建）远端临时文件用于断点续传直写
-func (sf *sftpFinder) OpenUpload(ctx context.Context, remoteDir, remoteFile string) (UploadSession, error) {
+func (sf *sftpFinder) OpenUpload(ctx context.Context, remoteDir, remoteFile string) (provider.UploadSession, error) {
 	// 解析远端目录
 	actualRemoteDir := parseVueFinderPath(remoteDir)
 	// 如果 remoteFile 包含路径，拆分
@@ -54,9 +56,25 @@ func (sf *sftpFinder) OpenUpload(ctx context.Context, remoteDir, remoteFile stri
 	return sess, nil
 }
 
-func NewSftpFinder(client *sftp.Client) Finder {
+func NewSftpFinder(client *sftp.Client) provider.CapabilityProvider {
 	return &sftpFinder{
 		client: client,
+	}
+}
+
+type sftpFinder struct {
+	client *sftp.Client
+}
+
+// Caps 返回当前后端具备的能力集合
+func (sf *sftpFinder) Caps() *provider.Capabilities {
+	return &provider.Capabilities{
+		Readable:          sf,
+		ResumableUploader: sf,
+		Writer:            sf,
+		Lister:            sf,
+		Searcher:          sf,
+		Previewer:         sf,
 	}
 }
 
@@ -97,17 +115,17 @@ func (sf *sftpFinder) Preview(ctx context.Context, path string) (bytes.Buffer, e
 	return buff, nil
 }
 
-func (sf *sftpFinder) Search(ctx context.Context, adapter, path, filter string) (Storages, error) {
+func (sf *sftpFinder) Search(ctx context.Context, adapter, path, filter string) (finder.Storages, error) {
 	storage, err := sf.Index(ctx, path)
 	if err != nil {
-		return Storages{}, err
+		return finder.Storages{}, err
 	}
 
-	storage.Files = slice.FilterMap(storage.Files, func(idx int, src FileInfo) (FileInfo, bool) {
+	storage.Files = slice.FilterMap(storage.Files, func(idx int, src finder.FileInfo) (finder.FileInfo, bool) {
 		if strings.Contains(src.Basename, filter) {
 			return src, true
 		}
-		return FileInfo{}, false
+		return finder.FileInfo{}, false
 	})
 
 	return storage, nil
@@ -122,7 +140,7 @@ func ensureZipExtension(target string) string {
 	return target
 }
 
-func (sf *sftpFinder) Archive(ctx context.Context, items []Item, target, base string) error {
+func (sf *sftpFinder) Archive(ctx context.Context, items []finder.Item, target, base string) error {
 	// 解析路径为实际文件系统路径
 	actualTarget := parseVueFinderPath(target)
 	actualBase := parseVueFinderPath(base)
@@ -301,7 +319,7 @@ func (sf *sftpFinder) walkAndZip(path string, zipWriter *zip.Writer, basePath st
 	return nil
 }
 
-func (sf *sftpFinder) Move(ctx context.Context, items []Item, target string) error {
+func (sf *sftpFinder) Move(ctx context.Context, items []finder.Item, target string) error {
 	// 解析目标路径为实际文件系统路径
 	actualTarget := parseVueFinderPath(target)
 
@@ -321,7 +339,7 @@ func (sf *sftpFinder) Move(ctx context.Context, items []Item, target string) err
 	return nil
 }
 
-func (sf *sftpFinder) Delete(ctx context.Context, items []Item, path string) error {
+func (sf *sftpFinder) Delete(ctx context.Context, items []finder.Item, path string) error {
 	// 解析路径为实际文件系统路径
 	actualPath := parseVueFinderPath(path)
 
@@ -333,12 +351,12 @@ func (sf *sftpFinder) Delete(ctx context.Context, items []Item, path string) err
 		}
 
 		switch item.Type {
-		case DIR:
+		case finder.DIR:
 			err := sf.RemoveDir(ctx, actualItemPath)
 			if err != nil {
 				return err
 			}
-		case FILE:
+		case finder.FILE:
 			err := sf.RemoveFile(ctx, actualItemPath)
 			if err != nil {
 				return err
@@ -642,44 +660,36 @@ func min(a, b int) int {
 }
 
 // parseVueFinderPath 解析 vuefinder 格式路径 (sftp://path 或 tmp://) 为实际文件系统路径
-func parseVueFinderPath(path string) string {
-	if !strings.Contains(path, "://") {
-		// 如果不是 vuefinder 格式，直接规范化返回
-		return normalizePath(path)
+func parseVueFinderPath(p string) string {
+	// 统一用 finder.ParseLocator 解析
+	loc, err := finder.ParseLocator(p)
+	if err != nil {
+		// 非 locator 格式，直接规范化
+		return normalizePath(p)
 	}
-
-	parts := strings.SplitN(path, "://", 2)
-	if len(parts) < 2 {
-		return "/"
+	// 无 scheme，则认为是普通路径
+	if loc.Scheme == "" {
+		return normalizePath(loc.Opaque)
 	}
-
-	// parts[0] 可能是适配器名称（如 sftp）或根目录名称（如 tmp）
-	// parts[1] 是实际路径
-	if parts[1] == "" {
-		// 如果 parts[1] 为空，检查 parts[0] 是否是根目录名称
-		// 例如：tmp:// -> /tmp
-		if parts[0] != "sftp" && parts[0] != "" {
-			// 可能是根目录名称，如 tmp:// -> /tmp
-			return normalizePath("/" + parts[0])
+	// 有 scheme 但 Opaque 为空的特殊情况：兼容类似 tmp://
+	if loc.Opaque == "" {
+		if loc.Scheme != "sftp" && loc.Scheme != "" {
+			return normalizePath("/" + loc.Scheme)
 		}
 		return "/"
 	}
-
-	return normalizePath(parts[1])
+	// 正常情况：使用 Opaque 部分
+	return normalizePath(loc.Opaque)
 }
 
 // formatVueFinderPath 将实际文件系统路径格式化为 vuefinder 格式 (sftp://path)
-func formatVueFinderPath(path string) string {
-	if strings.HasPrefix(path, pathPrefix) {
-		// 如果已经是 sftp:// 格式，需要规范化路径部分
-		// 例如：sftp:///var -> sftp:///var, sftp:/// -> sftp:///
-		pathPart := strings.TrimPrefix(path, pathPrefix)
-		normalized := normalizePath(pathPart)
-		return pathPrefix + normalized
-	}
-	// normalizePath 已经确保路径以 / 开头，所以直接拼接
-	normalized := normalizePath(path)
-	return pathPrefix + normalized
+func formatVueFinderPath(p string) string {
+	// 取出已有前缀的路径部分做规范化
+	pathPart := strings.TrimPrefix(p, pathPrefix)
+	normalized := normalizePath(pathPart)
+	// 用统一的 Locator 组装 sftp:// 路径
+	loc := finder.Locator{Scheme: "sftp", Opaque: normalized}
+	return loc.String()
 }
 
 // normalizePath 规范化路径，确保以 / 开头且没有多余的斜杠
@@ -694,7 +704,7 @@ func normalizePath(path string) string {
 	return "/" + path
 }
 
-func (sf *sftpFinder) Index(ctx context.Context, path string) (Storages, error) {
+func (sf *sftpFinder) Index(ctx context.Context, path string) (finder.Storages, error) {
 	// 确定实际路径和显示路径
 	actualPath, dirName := sf.resolvePath(path)
 
@@ -704,16 +714,16 @@ func (sf *sftpFinder) Index(ctx context.Context, path string) (Storages, error) 
 	// 每次 list 调用后，前端会调用 setStorages 更新 storages，所以需要始终返回所有根目录列表
 	storages, err := sf.findStorage()
 	if err != nil {
-		return Storages{}, err
+		return finder.Storages{}, err
 	}
 
 	// 扫描文件列表（只包含当前路径下的文件和文件夹）
 	files, err := sf.scanFiles(actualPath)
 	if err != nil {
-		return Storages{}, err
+		return finder.Storages{}, err
 	}
 
-	return Storages{
+	return finder.Storages{
 		Storages: storages,
 		Dirname:  dirName,
 		Files:    files,
@@ -751,13 +761,13 @@ func (sf *sftpFinder) findStorage() ([]string, error) {
 }
 
 // ScanFiles 查找指定路径下所有文件
-func (sf *sftpFinder) scan(path string) ([]FileInfo, error) {
+func (sf *sftpFinder) scan(path string) ([]finder.FileInfo, error) {
 	files, err := sf.client.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
 
-	fileInfos := make([]FileInfo, 0)
+	fileInfos := make([]finder.FileInfo, 0)
 
 	for _, file := range files {
 		f := convertToFileInfo(file, path)
@@ -768,7 +778,7 @@ func (sf *sftpFinder) scan(path string) ([]FileInfo, error) {
 }
 
 // convertToFileInfo 将 os.FileInfo 转换为 FileInfo
-func convertToFileInfo(file os.FileInfo, basePath string) FileInfo {
+func convertToFileInfo(file os.FileInfo, basePath string) finder.FileInfo {
 	ext := strings.TrimPrefix(filepath.Ext(file.Name()), ".")
 	mimeType := mime.TypeByExtension("." + ext)
 
@@ -784,7 +794,7 @@ func convertToFileInfo(file os.FileInfo, basePath string) FileInfo {
 	// 确定文件类型
 	fileType := determineFileType(file, basePath)
 
-	return FileInfo{
+	return finder.FileInfo{
 		Type:          fileType,
 		Dir:           dirPath,
 		Path:          filePath,
@@ -800,9 +810,9 @@ func convertToFileInfo(file os.FileInfo, basePath string) FileInfo {
 }
 
 // determineFileType 确定文件类型
-func determineFileType(file os.FileInfo, basePath string) FileType {
+func determineFileType(file os.FileInfo, basePath string) finder.FileType {
 	if file.IsDir() {
-		return DIR
+		return finder.DIR
 	}
 
 	if file.Mode()&os.ModeSymlink != 0 {
@@ -811,23 +821,23 @@ func determineFileType(file os.FileInfo, basePath string) FileType {
 			slog.Error("Failed to get link type",
 				"file", file.Name(),
 				"err", err)
-			return BrokenLINK
+			return finder.BrokenLINK
 		}
 		return fileType
 	}
 
-	return FILE
+	return finder.FILE
 }
 
 // getLinkType 获取软链接的目标类型
-func getLinkType(file os.FileInfo, basePath string) (FileType, error) {
+func getLinkType(file os.FileInfo, basePath string) (finder.FileType, error) {
 	// 构建完整的符号链接路径
 	linkPath := filepath.Join(basePath, file.Name())
 
 	// 首先检查符号链接文件本身是否存在
 	if _, err := os.Lstat(linkPath); err != nil {
 		if os.IsNotExist(err) {
-			return BrokenLINK, nil
+			return finder.BrokenLINK, nil
 		}
 		return "", fmt.Errorf("lstat link %s: %w", linkPath, err)
 	}
@@ -837,7 +847,7 @@ func getLinkType(file os.FileInfo, basePath string) (FileType, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// 这个错误应该不会发生，因为上面已经检查过了
-			return BrokenLINK, nil
+			return finder.BrokenLINK, nil
 		}
 		return "", fmt.Errorf("readlink %s: %w", linkPath, err)
 	}
@@ -851,19 +861,19 @@ func getLinkType(file os.FileInfo, basePath string) (FileType, error) {
 	targetInfo, err := os.Stat(targetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return BrokenLINK, nil
+			return finder.BrokenLINK, nil
 		}
 		return "", fmt.Errorf("stat target %s: %w", targetPath, err)
 	}
 
 	if targetInfo.IsDir() {
-		return DIR, nil
+		return finder.DIR, nil
 	}
-	return FILE, nil
+	return finder.FILE, nil
 }
 
-func (sf *sftpFinder) scanFiles(path string) ([]FileInfo, error) {
-	fileInfos := make([]FileInfo, 0)
+func (sf *sftpFinder) scanFiles(path string) ([]finder.FileInfo, error) {
+	fileInfos := make([]finder.FileInfo, 0)
 
 	// 扫描目录下的文件
 	files, err := sf.scan(path)
@@ -872,7 +882,7 @@ func (sf *sftpFinder) scanFiles(path string) ([]FileInfo, error) {
 	}
 
 	// 过滤掉 "." 和 ".." 目录，避免前端渲染时出现循环引用
-	filteredFiles := make([]FileInfo, 0, len(files))
+	filteredFiles := make([]finder.FileInfo, 0, len(files))
 	for _, file := range files {
 		if file.Basename != "." && file.Basename != ".." {
 			filteredFiles = append(filteredFiles, file)

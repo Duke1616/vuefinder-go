@@ -2,7 +2,6 @@ package web
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -180,7 +179,13 @@ func StreamingUploadHandler(h *Handler) http.HandlerFunc {
 		}
 
 		// 使用流式上传，边接收边写入
-		err = fd.UploadStream(context.Background(), filePart, remoteDir, remoteFile)
+		caps := fd.Caps()
+		if caps == nil || caps.Writer == nil {
+			slog.Error("finder does not support writer")
+			writeErrorResponse(w, http.StatusBadRequest, "finder does not support writer")
+			return
+		}
+		err = caps.Writer.UploadStream(r.Context(), filePart, remoteDir, remoteFile)
 		if err != nil {
 			slog.Error("上传文件失败", slog.Any("err", err))
 			writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("上传文件失败: %v", err))
@@ -188,15 +193,18 @@ func StreamingUploadHandler(h *Handler) http.HandlerFunc {
 		}
 
 		// 上传成功后，返回当前目录的文件列表
-		storage, err := fd.Index(context.Background(), remoteDir)
-		if err != nil {
-			slog.Error("获取文件列表失败", slog.Any("err", err))
-			writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("获取文件列表失败: %v", err))
+		if caps.Lister != nil {
+			storage, err := caps.Lister.Index(r.Context(), remoteDir)
+			if err != nil {
+				slog.Error("获取文件列表失败", slog.Any("err", err))
+				writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("获取文件列表失败: %v", err))
+				return
+			}
+			// 返回成功响应
+			writeSuccessResponse(w, storage)
 			return
 		}
-
-		// 返回成功响应
-		writeSuccessResponse(w, storage)
+		writeErrorResponse(w, http.StatusBadRequest, "finder does not support index")
 	}
 }
 
