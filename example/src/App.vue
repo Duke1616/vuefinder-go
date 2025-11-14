@@ -177,6 +177,7 @@ const customUploader = (uppy, context) => {
           _lastTime: Date.now(),
           _uiLastTs: 0,
           _emaSpeed: 0,
+          _progressStarted: false,
         })
         uploadTasks.value.push(task)
 
@@ -186,19 +187,33 @@ const customUploader = (uppy, context) => {
           (progress) => {
             // 统一单进度：取 offset 与 sftpWritten 的较大值作为可视化进度
             const now = Date.now()
-
-            const sent = Number(progress.bytesUploaded) || 0
+            // 仅以 SFTP 写入为准
             const total = Number(progress.bytesTotal) || task.total || task.size || 0
             const sftp = Number(progress.sftpWritten) || 0
 
             task.total = total
-            const vis = Math.max(sent, sftp)
-            task.loaded = Math.min(vis, total)
+            task.loaded = Math.min(sftp, total)
+
+            // 如果后端告知断点续传的起点，重置基线，避免速率被历史写入拉高
+            if (progress && typeof progress.resumeFrom === 'number' && isFinite(progress.resumeFrom)) {
+              task._progressStarted = true
+              task._lastLoaded = Number(progress.resumeFrom)
+              task._lastTime = now
+              task._uiLastTs = now
+            }
+
+            if (!task._progressStarted) {
+              task._progressStarted = true
+              task._lastLoaded = task.loaded
+              task._lastTime = now
+              task._uiLastTs = now
+              return
+            }
 
             // 仅在 1s 节拍时更新 UI 上的速度/ETA/进度，避免闪烁
             if (now - task._uiLastTs >= UI_UPDATE_MS || task.loaded >= total) {
               // 速度与 ETA（按当前阶段的基准进度计算）
-              const basisLoaded = task.loaded
+              const basisLoaded = sftp
               const dt = Math.max(0.2, (now - task._lastTime) / 1000)
               const dBytes = Math.max(0, basisLoaded - task._lastLoaded)
               const instSpeed = dBytes / dt
@@ -216,8 +231,8 @@ const customUploader = (uppy, context) => {
 
               // 维持 Uppy 的进度事件（可选）
               uppy.emit('upload-progress', uppyFile, {
-                bytesUploaded: progress.bytesUploaded,
-                bytesTotal: progress.bytesTotal,
+                bytesUploaded: sftp,
+                bytesTotal: total,
               })
             }
           },

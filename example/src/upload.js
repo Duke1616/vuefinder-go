@@ -22,18 +22,27 @@ export class WebSocketUploader {
       const uploadId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       // 重置内部状态，确保多次上传时能够正确启动
       this._startedSending = false;
+      let _firstServerProgress = true;
 
       // 发送阶段的进度节流器
       let _lastEmit = 0;
-      const emitSendingProgress = (bytes) => {
+      const progressState = {
+        total: Number(file.size) || 0,
+        written: 0,
+      };
+      const emitProgress = (extras) => {
         const now = Date.now();
         if (now - _lastEmit < this._progressIntervalMs) return;
         _lastEmit = now;
         if (onProgress) {
-          onProgress({
-            bytesUploaded: bytes,
-            bytesTotal: file.size,
-          });
+          const total = progressState.total || 0;
+          const written = Math.min(progressState.written || 0, total);
+          const payload = {
+            bytesTotal: total,
+            sftpWritten: written,
+            sftpPercent: total > 0 ? ((written / total) * 100).toFixed(2) : '0.00',
+          };
+          onProgress(extras ? { ...payload, ...extras } : payload);
         }
       };
 
@@ -54,29 +63,19 @@ export class WebSocketUploader {
           
           switch (msg.type) {
             case 'progress': {
-              // SFTP 写入进度
-              const total = Number(msg.size) || Number(file.size) || 0;
+              // 统一写入进度状态并触发节流后的进度事件
+              progressState.total = Number(msg.size) || Number(file.size) || 0;
               const sftpWritten = Number(msg.sftpWritten) || 0;
-              const offset = Number(msg.offset) || 0; // 已接收
-              const sftpPercent = total > 0 ? ((sftpWritten / total) * 100).toFixed(2) : '0.00';
-
-              if (onProgress) {
-                onProgress({
-                  // 已发送/已接收（客户端->服务端）
-                  bytesUploaded: offset,
-                  bytesTotal: total,
-                  // 已写入远端（服务端->SFTP）
-                  sftpWritten: sftpWritten,
-                  sftpPercent: sftpPercent,
-                });
-              }
+              const offset = Number(msg.offset) || 0; // 服务端已接收
+              progressState.written = Math.max(progressState.written, sftpWritten);
+              const extras = _firstServerProgress ? { resumeFrom: sftpWritten } : undefined;
+              emitProgress(extras);
+              _firstServerProgress = false;
 
               // 如果还未开始读取，收到初始 offset 后启动从该偏移读取
               if (!this._startedSending) {
                 this._startedSending = true;
-                this.readAndSendFile(ws, file, uploadId, offset, (bytes) => {
-                  emitSendingProgress(bytes);
-                });
+                this.readAndSendFile(ws, file, uploadId, offset, undefined);
               }
               break;
             }
