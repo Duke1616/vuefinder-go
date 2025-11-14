@@ -32,7 +32,7 @@ export class WebSocketUploader {
       };
       const emitProgress = (extras) => {
         const now = Date.now();
-        if (now - _lastEmit < this._progressIntervalMs) return;
+        if (!extras && (now - _lastEmit < this._progressIntervalMs)) return;
         _lastEmit = now;
         if (onProgress) {
           const total = progressState.total || 0;
@@ -47,14 +47,13 @@ export class WebSocketUploader {
       };
 
       ws.onopen = () => {
-        // 发送开始消息，请求服务器返回可续传的偏移
-        ws.send(JSON.stringify({
+        this._sendJSON(ws, {
           type: 'start',
           id: uploadId,
           fileName: file.name,
           path: path,
           size: file.size,
-        }));
+        });
       };
 
       ws.onmessage = (event) => {
@@ -75,7 +74,7 @@ export class WebSocketUploader {
               // 如果还未开始读取，收到初始 offset 后启动从该偏移读取
               if (!this._startedSending) {
                 this._startedSending = true;
-                this.readAndSendFile(ws, file, uploadId, offset, undefined);
+                this.readAndSendFile(ws, file, uploadId, offset);
               }
               break;
             }
@@ -132,65 +131,65 @@ export class WebSocketUploader {
     });
   }
 
-  readAndSendFile(ws, file, uploadId, startOffset, onProgress) {
+  readAndSendFile(ws, file, uploadId, startOffset) {
     const reader = new FileReader();
     let offset = Number(startOffset) || 0;
 
     const readNextChunk = () => {
+      // WebSocket 已关闭则停止
+      if (!this._wsOpen(ws)) {
+        return;
+      }
+      // 背压：发送缓冲过高时稍后重试
+      if (ws.bufferedAmount > this.chunkSize * 8) {
+        setTimeout(readNextChunk, 50);
+        return;
+      }
+      // 文件读取完成，发送结束消息
       if (offset >= file.size) {
-        // 文件读取完成，发送结束消息
-        try {
-          // 最后再发一次发送阶段进度，确保 UI 达到 100%
-          if (onProgress) {
-            onProgress(file.size);
-          }
-        } catch (_) {}
-        ws.send(JSON.stringify({
+        this._sendJSON(ws, {
           type: 'end',
           id: uploadId,
-        }));
+        });
         return;
       }
 
+      // 从当前偏移切出一块数据
       const chunk = file.slice(offset, offset + this.chunkSize);
       
       reader.onload = (e) => {
-        const arrayBuffer = e.target.result;
-        const bytes = new Uint8Array(arrayBuffer);
-        
-        // 转换为 base64
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        // 读到数据后再次确认连接状态
+        if (!this._wsOpen(ws)) {
+          return;
         }
-        const base64 = btoa(binary);
+        const arrayBuffer = e.target.result;
+        const base64 = this._b64Encode(new Uint8Array(arrayBuffer));
 
-        // 发送数据块，携带当前偏移供服务端随机写入
-        ws.send(JSON.stringify({
+        // 发送数据块
+        this._sendJSON(ws, {
           type: 'chunk',
           id: uploadId,
           offset: offset,
           data: base64,
-        }));
+        });
 
+        // 推进偏移量
         offset += arrayBuffer.byteLength;
         
-        // 更新进度
-        if (onProgress) {
-          onProgress(offset);
-        }
-
-        // 继续读取下一块
+        // 异步调度下一块
         setTimeout(readNextChunk, 0);
       };
 
       reader.onerror = (error) => {
+        // 本地读取失败，上报到服务端
         console.error(`[WebSocket上传] 读取文件块失败:`, error);
-        ws.send(JSON.stringify({
-          type: 'error',
-          id: uploadId,
-          error: '读取文件失败: ' + error.message,
-        }));
+        if (this._wsOpen(ws)) {
+          this._sendJSON(ws, {
+            type: 'error',
+            id: uploadId,
+            error: '读取文件失败: ' + error.message,
+          });
+        }
       };
 
       reader.readAsArrayBuffer(chunk);
@@ -198,5 +197,28 @@ export class WebSocketUploader {
 
     // 开始读取
     readNextChunk();
+  }
+
+  _wsOpen(ws) {
+    return ws && ws.readyState === WebSocket.OPEN;
+  }
+
+  _sendJSON(ws, obj) {
+    if (!this._wsOpen(ws)) return;
+    try {
+      ws.send(JSON.stringify(obj));
+    } catch (e) {
+      console.error('[WebSocket上传] 发送失败:', e);
+    }
+  }
+
+  _b64Encode(bytes) {
+    const B64_BLOCK_SIZE = 8192;
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += B64_BLOCK_SIZE) {
+      const sub = bytes.subarray(i, i + B64_BLOCK_SIZE);
+      parts.push(String.fromCharCode.apply(null, sub));
+    }
+    return btoa(parts.join(''));
   }
 }
