@@ -6,7 +6,7 @@
       :driver="driver"
       :config="{
         theme: 'valorite',
-        maxFileSize: '500MB',
+        maxFileSize: '5GB',
         fullScreen: true,
       }"
       :custom-uploader="customUploader"

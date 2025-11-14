@@ -52,43 +52,57 @@ export class WebSocketUploader {
         try {
           const msg = JSON.parse(event.data);
           
-          if (msg.type === 'progress') {
-            // SFTP 写入进度
-            const total = Number(msg.size) || Number(file.size) || 0;
-            const sftpWritten = Number(msg.sftpWritten) || 0;
-            const offset = Number(msg.offset) || 0; // 已接收
-            const sftpPercent = total > 0 ? ((sftpWritten / total) * 100).toFixed(2) : '0.00';
+          switch (msg.type) {
+            case 'progress': {
+              // SFTP 写入进度
+              const total = Number(msg.size) || Number(file.size) || 0;
+              const sftpWritten = Number(msg.sftpWritten) || 0;
+              const offset = Number(msg.offset) || 0; // 已接收
+              const sftpPercent = total > 0 ? ((sftpWritten / total) * 100).toFixed(2) : '0.00';
 
-            if (onProgress) {
-              onProgress({
-                // 已发送/已接收（客户端->服务端）
-                bytesUploaded: offset,
-                bytesTotal: total,
-                // 已写入远端（服务端->SFTP）
-                sftpWritten: sftpWritten,
-                sftpPercent: sftpPercent,
-              });
+              if (onProgress) {
+                onProgress({
+                  // 已发送/已接收（客户端->服务端）
+                  bytesUploaded: offset,
+                  bytesTotal: total,
+                  // 已写入远端（服务端->SFTP）
+                  sftpWritten: sftpWritten,
+                  sftpPercent: sftpPercent,
+                });
+              }
+
+              // 如果还未开始读取，收到初始 offset 后启动从该偏移读取
+              if (!this._startedSending) {
+                this._startedSending = true;
+                this.readAndSendFile(ws, file, uploadId, offset, (bytes) => {
+                  emitSendingProgress(bytes);
+                });
+              }
+              break;
             }
 
-            // 如果还未开始读取，收到初始 offset 后启动从该偏移读取
-            if (!this._startedSending) {
-              this._startedSending = true;
-              this.readAndSendFile(ws, file, uploadId, offset, (bytes) => {
-                emitSendingProgress(bytes);
-              });
+            case 'success': {
+              ws.close();
+              if (onSuccess) {
+                onSuccess(msg.data);
+              }
+              resolve(msg.data);
+              break;
             }
-          } else if (msg.type === 'success') {
-            ws.close();
-            if (onSuccess) {
-              onSuccess(msg.data);
+
+            case 'error': {
+              console.error(`[WebSocket上传] 上传失败: ${msg.error || '未知错误'}`);
+              ws.close();
+              const error = new Error(msg.error || '上传失败');
+              if (onError) onError(error);
+              reject(error);
+              break;
             }
-            resolve(msg.data);
-          } else if (msg.type === 'error') {
-            console.error(`[WebSocket上传] 上传失败: ${msg.error || '未知错误'}`);
-            ws.close();
-            const error = new Error(msg.error || '上传失败');
-            if (onError) onError(error);
-            reject(error);
+
+            default: {
+              console.warn('未知的消息类型:', msg.type, msg);
+              break;
+            }
           }
         } catch (err) {
           console.error(`[WebSocket上传] 解析服务器消息失败:`, err);
